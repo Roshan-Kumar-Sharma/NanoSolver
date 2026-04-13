@@ -54,7 +54,7 @@ object SolverCache {
     }
 
     /** Current number of cached entries. */
-    @Synchronized
+    @get:Synchronized
     val size: Int get() = cache.size
 
     /** Clears all entries (useful for testing). */

@@ -65,7 +65,7 @@ data class LatencyStats(
  *      a. In Android Studio: Run → Profile → CPU Profiler
  *      b. Select "System Trace" recording configuration
  *      c. Start recording, run Matiks Sprint mode for 10–20 problems
- *      d. Stop recording and look for the "NanoSolver/*" slices
+ *      d. Stop recording and look for the NanoSolver/ stage slices
  *      e. The widest slice is the bottleneck. Typical finding:
  *           OCR ~80ms, Preprocess ~8ms, Solve ~0.1ms, Inject ~2ms
  *

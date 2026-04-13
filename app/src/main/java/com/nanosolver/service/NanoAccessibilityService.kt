@@ -75,6 +75,16 @@ class NanoAccessibilityService : AccessibilityService() {
         private const val TAG = "NanoA11y"
 
         /**
+         * Action ID for pressing the IME action button (Enter / Submit / Go on the soft keyboard).
+         *
+         * AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER was added to the platform
+         * in API 30. For API 27–29 (our minSdk), the AndroidX compat backport maps this action
+         * to the value 0x01000000. Using the literal avoids a compat API that doesn't resolve
+         * cleanly as an Int constant across all supported API levels.
+         */
+        private const val ACTION_IME_ENTER = 0x01000000
+
+        /**
          * The live service instance, or null if the user hasn't enabled it.
          *
          * @Volatile ensures visibility across threads without full synchronization.
@@ -241,7 +251,7 @@ class NanoAccessibilityService : AccessibilityService() {
             }
         }
         // Submit node is stale or missing — fall back to IME action on the input
-        return inputNode.performAction(AccessibilityNodeInfo.ACTION_IME_ENTER)
+        return inputNode.performAction(ACTION_IME_ENTER)
     }
 
     /**
@@ -257,18 +267,19 @@ class NanoAccessibilityService : AccessibilityService() {
             return false
         }
 
+        var submitNode: AccessibilityNodeInfo? = null
         return try {
             val textSet = setAnswerText(inputNode, answer)
             if (!textSet) return false
 
-            val submitNode = findSubmitNode(root)
+            submitNode = findSubmitNode(root)
             val submitted  = if (submitNode != null) {
                 val clicked = submitNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                 Log.d(TAG, "inject: submit clicked (slow path): $clicked")
                 clicked
             } else {
                 Log.d(TAG, "inject: no submit button found — pressing IME action")
-                inputNode.performAction(AccessibilityNodeInfo.ACTION_IME_ENTER)
+                inputNode.performAction(ACTION_IME_ENTER)
             }
 
             if (submitted) {
@@ -444,7 +455,14 @@ class NanoAccessibilityService : AccessibilityService() {
         clipboard.setPrimaryClip(ClipData.newPlainText("nano_answer", answer.toString()))
 
         inputNode.performAction(AccessibilityNodeInfo.ACTION_FOCUS)
-        inputNode.performAction(AccessibilityNodeInfo.ACTION_SELECT_ALL)
+        // Select all existing text via ACTION_SET_SELECTION with full range,
+        // so paste replaces the content rather than appending.
+        // (ACTION_SELECT_ALL is not on AccessibilityNodeInfo; this is the equivalent.)
+        val selBundle = Bundle().apply {
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_START_INT, 0)
+            putInt(AccessibilityNodeInfo.ACTION_ARGUMENT_SELECTION_END_INT, Int.MAX_VALUE)
+        }
+        inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_SELECTION, selBundle)
         val pasted = inputNode.performAction(AccessibilityNodeInfo.ACTION_PASTE)
         Log.d(TAG, "Clipboard paste: success=$pasted")
         return pasted
@@ -495,7 +513,7 @@ class NanoAccessibilityService : AccessibilityService() {
         if (depth > maxDepth) return
         val indent = "  ".repeat(depth)
         Log.v(TAG,
-            "$indent[${node.className?.substringAfterLast('.')}]" +
+            "$indent[${node.className?.toString()?.substringAfterLast('.')}]" +
             " id=${node.viewIdResourceName}" +
             " edit=${node.isEditable}" +
             " click=${node.isClickable}" +
