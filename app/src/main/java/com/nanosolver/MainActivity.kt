@@ -3,7 +3,8 @@ package com.nanosolver
 import android.Manifest
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.net.Uri
+import android.annotation.SuppressLint
+import androidx.core.net.toUri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -93,7 +94,7 @@ class MainActivity : AppCompatActivity() {
     private fun requestOverlayPermission() {
         val intent = Intent(
             Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-            Uri.parse("package:$packageName")
+            "package:$packageName".toUri()
         )
         overlayPermissionLauncher.launch(intent)
     }
@@ -122,6 +123,9 @@ class MainActivity : AppCompatActivity() {
     // UI state
     // -------------------------------------------------------------------------
 
+    // @SuppressLint: these are developer-facing status strings, not user-visible
+    // translated content — moving them to string resources adds no real value here.
+    @SuppressLint("SetTextI18n")
     private fun updateUI() {
         val hasOverlay = Settings.canDrawOverlays(this)
         val hasNotification = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||

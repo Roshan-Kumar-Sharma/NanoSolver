@@ -16,13 +16,6 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <!--
-        FOREGROUND_SERVICE_MEDIA_PROJECTION: Required on API 34+ when a foreground service
-        uses android:foregroundServiceType="mediaProjection". Declared now so the app is
-        ready for Phase 2 (screen capture) without a manifest change.
-    -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
-
-    <!--
         POST_NOTIFICATIONS: Required on API 33+ (Android 13+) to show notifications at all.
         Since our minSdk is 27, the code handles requesting this at runtime.
     -->
@@ -48,12 +41,13 @@
 
         <!--
             OverlayService runs as a foreground service.
-            foregroundServiceType="mediaProjection" is declared here to be ready for Phase 2.
+            No foregroundServiceType needed for Phase 1 (overlay only).
+            In Phase 2 we will add foregroundServiceType="mediaProjection" here
+            alongside passing a MediaProjection token to startForeground().
             android:exported="false" means no other app can start this service directly.
         -->
         <service
             android:name=".service.OverlayService"
-            android:foregroundServiceType="mediaProjection"
             android:exported="false" />
 
     </application>
