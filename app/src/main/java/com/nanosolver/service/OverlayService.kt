@@ -7,7 +7,6 @@ import android.app.NotificationManager
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.media.projection.MediaProjection
@@ -26,69 +25,58 @@ import androidx.core.app.NotificationCompat
 import com.nanosolver.capture.ScreenCaptureManager
 import com.nanosolver.ocr.ImagePreprocessor
 import com.nanosolver.ocr.TextExtractor
+import com.nanosolver.pipeline.LatencyStats
+import com.nanosolver.pipeline.SolverPipeline
 import com.nanosolver.solver.MathParser
-import com.nanosolver.service.NanoAccessibilityService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * OverlayService — Phase 3
+ * OverlayService — Phase 6
  *
- * Now does two things:
- *  1. Shows the draggable floating "▶ Solver" overlay (from Phase 1).
- *  2. Runs the MediaProjection → VirtualDisplay → ImageReader capture pipeline.
+ * Wires all pipeline stages together via [SolverPipeline] and adds:
  *
- * PHASE 3+5 ADDITIONS vs PHASE 2:
+ *  1. TOGGLE — the overlay button now pauses/resumes the solver without
+ *              stopping screen capture (no re-consent required).
  *
- * E. CoroutineScope (serviceScope): Owns all coroutines launched by this service.
- *    Uses SupervisorJob so a failed OCR coroutine doesn't cancel the whole scope.
- *    Cancelled in onDestroy() to stop any in-flight work cleanly.
+ *  2. LATENCY HUD — the overlay button briefly shows per-frame latency
+ *                   ("= 42  [87ms]") so you can see real pipeline speed.
  *
- * F. ImagePreprocessor: grayscale + Otsu threshold each frame before OCR.
- *
- * G. TextExtractor: ML Kit recognizer wrapped as a suspend function.
- *
- * H. ocrBusy (AtomicBoolean): prevents frame-queuing.
- *    WHY: ML Kit inference takes ~50–120ms. At 30fps a new frame arrives every
- *    ~33ms. Without a gate, we'd launch 3–4 parallel OCR jobs per second, each
- *    holding a Bitmap in memory. The gate ensures at most one OCR job runs at
- *    a time; frames that arrive while OCR is busy are dropped (recycled).
- *    This is intentional — we always want the LATEST frame, not a backlog.
+ * WHAT CHANGED FROM PHASE 5:
+ *   - Removed inline handleFrame() + ocrBusy fields.
+ *   - All pipeline logic lives in SolverPipeline (capture → preprocess → OCR
+ *     → solve → inject) with pipelining: gate released before inject so the
+ *     next frame's OCR can overlap with this frame's injection.
+ *   - Button click implements the Phase 6 TODO: toggles SolverPipeline.enabled.
  */
 class OverlayService : Service() {
 
     companion object {
         private const val TAG = "OverlayService"
-        private const val CHANNEL_ID = "nano_solver_overlay"
+        private const val CHANNEL_ID     = "nano_solver_overlay"
         private const val NOTIFICATION_ID = 1
 
-        /** Intent extras for passing the MediaProjection consent result. */
-        const val EXTRA_RESULT_CODE      = "extra_result_code"
-        const val EXTRA_PROJECTION_DATA  = "extra_projection_data"
+        const val EXTRA_RESULT_CODE     = "extra_result_code"
+        const val EXTRA_PROJECTION_DATA = "extra_projection_data"
 
         @Volatile var isRunning:     Boolean = false; private set
         @Volatile var captureActive: Boolean = false; private set
     }
 
     // CoroutineScope tied to this service's lifetime.
-    // SupervisorJob: if one OCR coroutine throws, others keep running.
-    // Dispatchers.Default: runs on the shared CPU thread pool — keeps main thread free.
+    // SupervisorJob: if one pipeline coroutine throws, others keep running.
+    // Dispatchers.Default: off the main thread for CPU + IO work.
     private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
-    // Prevents more than one OCR job running at once (see phase note H above).
-    // AtomicBoolean is thread-safe: compareAndSet(false, true) is an atomic
-    // "check + flip" that can't be interrupted between threads.
-    private val ocrBusy = AtomicBoolean(false)
-
-    private lateinit var windowManager: WindowManager
+    private lateinit var windowManager:    WindowManager
     private lateinit var imagePreprocessor: ImagePreprocessor
-    private lateinit var textExtractor: TextExtractor
-    private lateinit var mathParser: MathParser
-    private var overlayButton: View? = null
+    private lateinit var textExtractor:    TextExtractor
+    private lateinit var mathParser:       MathParser
+    private lateinit var solverPipeline:   SolverPipeline
+
+    private var overlayButton:  View? = null
     private var captureManager: ScreenCaptureManager? = null
     private var mediaProjection: MediaProjection? = null
 
@@ -98,17 +86,30 @@ class OverlayService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        isRunning = true
+        isRunning         = true
         windowManager     = getSystemService(WINDOW_SERVICE) as WindowManager
         imagePreprocessor = ImagePreprocessor()
         textExtractor     = TextExtractor()
         mathParser        = MathParser()
+
+        // Build the pipeline. Injection happens inside SolverPipeline (Stage 4).
+        // The onAnswer callback runs on Dispatchers.Default after inject completes;
+        // we only need to post to the main thread here for the overlay UI update.
+        solverPipeline = SolverPipeline(
+            scope        = serviceScope,
+            preprocessor = imagePreprocessor,
+            extractor    = textExtractor,
+            parser       = mathParser
+        ) { answer, stats ->
+            Handler(Looper.getMainLooper()).post {
+                showAnswer(answer, stats)
+            }
+        }
+
         createNotificationChannel()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // If the OS delivers a null intent (shouldn't happen with START_NOT_STICKY,
-        // but guard anyway), we can't proceed without a fresh token.
         if (intent == null) {
             Log.w(TAG, "onStartCommand received null intent — stopping service")
             stopSelf()
@@ -124,11 +125,6 @@ class OverlayService : Service() {
             return START_NOT_STICKY
         }
 
-        // startForeground() MUST be called before getMediaProjection().
-        //
-        // On API 29+, pass FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION.
-        // This is what satisfies Android's "project_media" permission check on API 34.
-        // The 2-arg overload is kept for API 26–28 compatibility.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -142,8 +138,6 @@ class OverlayService : Service() {
         showOverlay()
         startScreenCapture(resultCode, projectionData)
 
-        // START_NOT_STICKY: do NOT restart if killed. The MediaProjection token is
-        // single-use — once the service dies, the user must re-consent.
         return START_NOT_STICKY
     }
 
@@ -151,8 +145,8 @@ class OverlayService : Service() {
         super.onDestroy()
         isRunning     = false
         captureActive = false
-        serviceScope.cancel()   // cancels all in-flight OCR coroutines
-        textExtractor.close()   // releases TFLite model from memory
+        serviceScope.cancel()
+        textExtractor.close()
         stopCapture()
         removeOverlay()
         Log.i(TAG, "Service destroyed")
@@ -168,17 +162,13 @@ class OverlayService : Service() {
         val projectionManager =
             getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
 
-        // getMediaProjection() uses the token from user consent to create the
-        // MediaProjection instance. Must be called after startForeground() on API 34.
         mediaProjection = projectionManager.getMediaProjection(resultCode, projectionData)
 
-        // Register a callback to handle the user revoking screen share
-        // (e.g. dismissing the "You're sharing your screen" notification).
         mediaProjection!!.registerCallback(object : MediaProjection.Callback() {
             override fun onStop() {
                 Log.i(TAG, "MediaProjection stopped by user")
                 Handler(Looper.getMainLooper()).post {
-                    captureActive = false
+                    captureActive  = false
                     captureManager = null
                     mediaProjection = null
                     updateOverlayButtonState()
@@ -187,7 +177,9 @@ class OverlayService : Service() {
         }, Handler(Looper.getMainLooper()))
 
         captureManager = ScreenCaptureManager(this, mediaProjection!!).apply {
-            onFrame = { bitmap -> handleFrame(bitmap) }
+            // Each frame is handed directly to SolverPipeline.
+            // processFrame() owns the bitmap from this point.
+            onFrame = { bitmap -> solverPipeline.processFrame(bitmap) }
             start()
         }
 
@@ -199,67 +191,8 @@ class OverlayService : Service() {
 
     private fun stopCapture() {
         captureManager?.stop()
-        captureManager  = null
-        mediaProjection = null
-    }
-
-    /**
-     * Called on the CaptureThread for each new screen frame.
-     *
-     * The ocrBusy gate prevents frame queuing:
-     *   - compareAndSet(false, true) atomically flips the flag to true only if
-     *     it was false. If another OCR job is running (flag already true), this
-     *     call returns false and we drop the frame immediately.
-     *   - The finally block always resets the flag so the next frame can proceed.
-     *
-     * FULL PIPELINE (Phase 3):
-     *   Raw frame → preprocess (grayscale + threshold) → ML Kit OCR → log text
-     *   Phase 4 will add:  → MathParser.solve(text) → answer
-     *   Phase 5 will add:  → AccessibilityService.inject(answer)
-     */
-    private fun handleFrame(bitmap: Bitmap) {
-        if (!ocrBusy.compareAndSet(false, true)) {
-            // OCR is still running from the previous frame. Drop this frame.
-            bitmap.recycle()
-            return
-        }
-
-        // Launch on Dispatchers.Default (already the service scope's dispatcher).
-        // The frame bitmap is handed off to this coroutine; we don't touch it after.
-        serviceScope.launch {
-            try {
-                // Step 1: Preprocess — grayscale + Otsu threshold
-                // Runs on CPU (Dispatchers.Default). ~5ms for a 1080p frame.
-                val preprocessed = imagePreprocessor.preprocess(bitmap)
-                bitmap.recycle()   // original no longer needed
-
-                // Step 2: OCR — ML Kit TFLite inference
-                // .await() suspends this coroutine until ML Kit finishes (~50–120ms).
-                // The thread is NOT blocked — other coroutines can run during this time.
-                val rawText = textExtractor.extract(preprocessed)
-                preprocessed.recycle()
-
-                // Step 3: Solve — recursive descent parser, ~0.1ms
-                if (rawText.isNotBlank()) {
-                    val answer = mathParser.solve(rawText)
-                    if (answer != null) {
-                        // Inject first (before showing on overlay) so the answer is
-                        // in the input field as quickly as possible. NanoAccessibilityService
-                        // runs its own Binder IPC (~1–3ms) — still much faster than the user.
-                        NanoAccessibilityService.injectAnswer(answer)
-                        // Update overlay UI (must run on the main thread)
-                        Handler(Looper.getMainLooper()).post { showAnswer(answer) }
-                    }
-                }
-
-            } catch (e: Exception) {
-                Log.e(TAG, "Frame pipeline error: ${e.message}")
-                // Don't crash the service over a single bad frame
-            } finally {
-                // Always release the gate so the next frame can be processed.
-                ocrBusy.set(false)
-            }
-        }
+        captureManager   = null
+        mediaProjection  = null
     }
 
     // -------------------------------------------------------------------------
@@ -271,9 +204,7 @@ class OverlayService : Service() {
             CHANNEL_ID,
             "Nano Solver",
             NotificationManager.IMPORTANCE_LOW
-        ).apply {
-            description = "Active while Nano Solver overlay is running"
-        }
+        ).apply { description = "Active while Nano Solver overlay is running" }
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
@@ -288,12 +219,12 @@ class OverlayService : Service() {
     }
 
     private fun updateNotification(capturing: Boolean) {
-        val manager = getSystemService(NotificationManager::class.java)
-        manager.notify(NOTIFICATION_ID, buildNotification(capturing))
+        getSystemService(NotificationManager::class.java)
+            .notify(NOTIFICATION_ID, buildNotification(capturing))
     }
 
     // -------------------------------------------------------------------------
-    // Overlay window (unchanged from Phase 1)
+    // Overlay window
     // -------------------------------------------------------------------------
 
     private fun showOverlay() {
@@ -304,31 +235,39 @@ class OverlayService : Service() {
         windowManager.addView(button, params)
     }
 
+    /**
+     * Syncs button appearance to the current pipeline state.
+     *
+     * Three states:
+     *   ● Solving   — capture active, solver enabled  (green)
+     *   ⏸ Paused    — capture active, solver paused   (amber)
+     *   ▶ Solver    — capture not active              (blue)
+     */
     private fun updateOverlayButtonState() {
         (overlayButton as? Button)?.apply {
-            text = if (captureActive) "● Solving" else "▶ Solver"
-            setBackgroundColor(
-                if (captureActive) Color.parseColor("#2E7D32")
-                else               Color.parseColor("#1565C0")
-            )
+            when {
+                !captureActive           -> { text = "▶ Solver";  setBackgroundColor(Color.parseColor("#1565C0")) }
+                solverPipeline.enabled   -> { text = "● Solving"; setBackgroundColor(Color.parseColor("#2E7D32")) }
+                else                     -> { text = "⏸ Paused";  setBackgroundColor(Color.parseColor("#E65100")) }
+            }
         }
     }
 
     /**
-     * Displays the computed answer on the overlay button.
+     * Displays the answer and total pipeline latency on the overlay button for 1.5s.
      *
-     * Shows the answer for 1.5 seconds (long enough to read and type it),
-     * then reverts back to "● Solving" so it's clear the solver is still running.
+     * Example: "= 42  [87ms]"
      *
-     * Must be called on the main thread — WindowManager.updateViewLayout() is
-     * not thread-safe. We post() to the main handler from the coroutine.
+     * The latency figure is the end-to-end wall-clock time from frame-in to inject-complete.
+     * This gives immediate real-world feedback on pipeline performance.
+     *
+     * Must be called on the main thread.
      */
-    private fun showAnswer(answer: Long) {
+    private fun showAnswer(answer: Long, stats: LatencyStats) {
         val button = overlayButton as? Button ?: return
-        button.text = "= $answer"
-        button.setBackgroundColor(Color.parseColor("#E65100"))  // deep orange = answer ready
+        button.text = "= $answer  [${stats.totalMs}ms]"
+        button.setBackgroundColor(Color.parseColor("#6A1B9A"))  // purple = answer ready
 
-        // Revert to "solving" state after 1.5s so the user knows we're still running
         button.postDelayed({
             if (captureActive) updateOverlayButtonState()
         }, 1500)
@@ -358,23 +297,23 @@ class OverlayService : Service() {
             setPadding(40, 20, 40, 20)
         }
 
-        var downX = 0;    var downY = 0
+        var downX = 0;     var downY = 0
         var downRawX = 0f; var downRawY = 0f
         var dragged = false
 
         button.setOnTouchListener { _, event ->
             when (event.action) {
                 MotionEvent.ACTION_DOWN -> {
-                    downX = params.x;     downY = params.y
-                    downRawX = event.rawX; downRawY = event.rawY
-                    dragged = false
+                    downX    = params.x;      downY    = params.y
+                    downRawX = event.rawX;    downRawY = event.rawY
+                    dragged  = false
                     true
                 }
                 MotionEvent.ACTION_MOVE -> {
                     val dx = (event.rawX - downRawX).toInt()
                     val dy = (event.rawY - downRawY).toInt()
                     if (Math.abs(dx) > 10 || Math.abs(dy) > 10) {
-                        dragged = true
+                        dragged  = true
                         params.x = downX + dx
                         params.y = downY + dy
                         windowManager.updateViewLayout(button, params)
@@ -390,9 +329,18 @@ class OverlayService : Service() {
         }
 
         button.setOnClickListener {
-            // TODO Phase 6: toggle solver pipeline on/off
-            button.setBackgroundColor(Color.parseColor("#0D47A1"))
-            button.postDelayed({ updateOverlayButtonState() }, 150)
+            // Phase 6 toggle: flip the pipeline enabled flag.
+            //
+            // The ScreenCaptureManager keeps running — no re-consent needed to resume.
+            // Frames that arrive while disabled are recycled immediately in processFrame().
+            //
+            // This is the fix for the Phase 5 TODO:
+            //   // TODO Phase 6: toggle solver pipeline on/off
+            if (captureActive) {
+                solverPipeline.enabled = !solverPipeline.enabled
+                Log.i(TAG, "Solver toggled: enabled=${solverPipeline.enabled}")
+            }
+            updateOverlayButtonState()
         }
 
         return button
