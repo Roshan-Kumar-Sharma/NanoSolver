@@ -9,63 +9,65 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * NanoAccessibilityService — Phase 5
+ * NanoAccessibilityService — Phase 7
  *
- * Injects the computed answer into Matiks' answer input field and clicks Submit.
- * Called by OverlayService after MathParser produces a result.
- *
- * ──────────────────────────────────────────────────────────────────────────
- * HOW ACCESSIBILITYSERVICE DIFFERS FROM EVERYTHING ELSE IN THIS PROJECT
- *
- * MediaProjection reads screen pixels. This service reads and WRITES the
- * UI widget tree of another app. It operates at a higher abstraction level:
- * instead of pixels, it works with semantic nodes (buttons, text fields, etc.)
- *
- * Android's IPC model: every time we call node.performAction(), a Binder
- * transaction fires from our process → the target app's process → back.
- * It's ~0.5–2ms per call. Calling 3 actions (focus, set text, click) costs
- * ~2–6ms total — completely negligible compared to OCR time.
+ * Phase 7 adds NODE REFERENCE CACHING to cut inject latency from ~5–15ms
+ * to ~1–3ms after the first problem in a session.
  *
  * ──────────────────────────────────────────────────────────────────────────
- * STATIC INSTANCE PATTERN
+ * WHY NODE CACHING MATTERS
  *
- * AccessibilityServices are created and destroyed by Android, not by the
- * application. We can't start or reference them with startService() or
- * binding. The standard pattern is a companion object that captures the
- * live instance in onServiceConnected() and clears it in onDestroy().
+ * The Phase 5 implementation called rootInActiveWindow → tree traversal on
+ * every single inject. For Matiks Sprint mode (30–60 problems/minute), this
+ * means 30–60 full DFS traversals of the UI tree per minute. Each traversal
+ * takes 3–12ms depending on tree depth.
  *
- * OverlayService calls NanoAccessibilityService.injectAnswer(answer) — a
- * static function that delegates to the live instance if one exists.
+ * In Sprint mode, the answer input and submit button are the SAME physical
+ * views for the entire game session — Matiks reuses them and just changes
+ * the question text. So once we've located these nodes, we can hold the
+ * reference and reuse it directly, skipping the traversal.
  *
  * ──────────────────────────────────────────────────────────────────────────
- * NODE SEARCH STRATEGY
+ * CACHE INVALIDATION
  *
- * We don't know Matiks' exact view IDs at build time (they may change across
- * app versions). Instead we use three fallback strategies in order:
+ * The cache is invalidated in two cases:
  *
- *   1. findAccessibilityNodeInfosByViewId() — fastest, but needs the exact ID.
- *      We try common patterns like "in.matiks:id/answer_input".
+ *   1. TYPE_WINDOW_STATE_CHANGED — the user navigated away from the game
+ *      (e.g. went to the home screen or a different Activity). The cached
+ *      nodes would belong to the old window and would fail on access.
  *
- *   2. isEditable + isEnabled + isVisibleToUser — finds any active text field.
- *      Works for both native views and WebView inputs in Chrome.
+ *   2. node.refresh() returns false — the cached node's underlying view was
+ *      detached from the window (e.g. Matiks recreated the layout). The
+ *      refresh() call is cheap (one Binder round-trip) and is the documented
+ *      way to check node liveness without re-traversing the tree.
  *
- *   3. Text hint matching — looks for nodes whose hint/placeholder text
- *      contains common input prompts ("answer", "type your answer").
+ * On invalidation we fall back to the slow path (full tree traversal) and
+ * re-populate the cache with the newly found nodes.
  *
- * For the submit button, we follow the same 3-strategy approach looking for
- * clickable nodes with common submit labels.
+ * ──────────────────────────────────────────────────────────────────────────
+ * THREAD SAFETY
+ *
+ * onAccessibilityEvent() fires on the service's main looper thread.
+ * inject() is called from SolverPipeline running on Dispatchers.Default.
+ *
+ * Both paths access [cachedInputNode] and [cachedSubmitNode]. We protect
+ * them with [nodeCacheLock] using synchronized{} blocks. The lock is held
+ * only for the brief moment of cache read/write — never during the Binder
+ * IPC calls (performAction, refresh) so contention is negligible.
  *
  * ──────────────────────────────────────────────────────────────────────────
  * DEBUGGING TIPS
  *
- * If injection doesn't work, enable VERBOSE logging and inspect the tree:
- *   adb logcat -s NanoA11y:V
+ * Fast path vs slow path: adb logcat -s NanoA11y:D
+ *   "fast path" = cached node reused (target: >95% of injects after problem 1)
+ *   "slow path" = full tree search (expected only on session start + window changes)
  *
- * The logNodeTree() call in findAnswerInput() dumps the full accessibility
- * tree of Matiks' window so you can identify the correct node IDs/classes.
+ * If you see "slow path" on every inject, the cache is being invalidated too
+ * aggressively. Check whether Matiks fires TYPE_WINDOW_STATE_CHANGED between
+ * problems (it shouldn't in Sprint mode — only in menu navigation).
  *
- * You can also use: adb shell uiautomator dump /sdcard/ui.xml && adb pull /sdcard/ui.xml
- * to get the full XML view hierarchy of the current screen.
+ * Node tree dump: adb logcat -s NanoA11y:V
+ * UI XML dump:   adb shell uiautomator dump /sdcard/ui.xml && adb pull /sdcard/ui.xml
  */
 class NanoAccessibilityService : AccessibilityService() {
 
@@ -85,7 +87,7 @@ class NanoAccessibilityService : AccessibilityService() {
         val isEnabled: Boolean get() = instance != null
 
         /**
-         * Called by OverlayService when a new answer is computed.
+         * Called by SolverPipeline when a new answer is computed.
          * Thread-safe: can be called from any thread.
          *
          * @return true if the answer was successfully injected into the input field.
@@ -101,6 +103,33 @@ class NanoAccessibilityService : AccessibilityService() {
     }
 
     // -------------------------------------------------------------------------
+    // Node cache
+    // -------------------------------------------------------------------------
+
+    /**
+     * Lock protecting [cachedInputNode] and [cachedSubmitNode].
+     * Held only for cache reads/writes, never across Binder IPC calls.
+     */
+    private val nodeCacheLock = Any()
+
+    /**
+     * Cached reference to the answer input node.
+     *
+     * After the first successful inject, we hold this reference (without recycling
+     * it) so future injects can skip the tree traversal. Invalidated on:
+     *   - TYPE_WINDOW_STATE_CHANGED (window navigation)
+     *   - node.refresh() returning false (view was detached)
+     *   - A failed inject attempt (safety reset)
+     */
+    private var cachedInputNode: AccessibilityNodeInfo?  = null
+
+    /**
+     * Cached reference to the submit button node.
+     * Same lifecycle as [cachedInputNode].
+     */
+    private var cachedSubmitNode: AccessibilityNodeInfo? = null
+
+    // -------------------------------------------------------------------------
     // Service lifecycle
     // -------------------------------------------------------------------------
 
@@ -111,102 +140,180 @@ class NanoAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Called for every accessibility event matching our config filters.
-     * We don't need events to drive injection (OverlayService does that),
-     * but we log them at VERBOSE level for debugging.
+     * Handles accessibility events.
+     *
+     * TYPE_WINDOW_STATE_CHANGED fires when the user navigates to a different
+     * Activity/Dialog. In Sprint mode this fires when:
+     *   - The user opens or closes the game
+     *   - Matiks shows an interstitial (round end, score screen)
+     *   - The user presses Back / Home
+     *
+     * It does NOT fire between individual problems within the same round —
+     * that's why caching is safe across the full Sprint session.
      */
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         Log.v(TAG, "Event: type=${AccessibilityEvent.eventTypeToString(event.eventType)} " +
-            "pkg=${event.packageName} class=${event.className}")
+            "pkg=${event.packageName}")
+
+        if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+            invalidateNodeCache()
+            Log.d(TAG, "Node cache invalidated (window state changed pkg=${event.packageName})")
+        }
     }
 
-    /** Called when the system needs to interrupt our service (e.g. user navigates away). */
     override fun onInterrupt() {
         Log.i(TAG, "Accessibility service interrupted")
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        invalidateNodeCache()
         instance = null
         Log.i(TAG, "Accessibility service destroyed")
     }
 
     // -------------------------------------------------------------------------
-    // Injection
+    // Injection — public entry point
     // -------------------------------------------------------------------------
 
     /**
-     * Main injection entry point. Gets the root window node and delegates
-     * to [injectIntoWindow]. Always recycles the root node in a finally block.
+     * Main injection entry point. Attempts the fast path (cached nodes) before
+     * falling back to the slow path (full tree traversal).
      *
-     * rootInActiveWindow returns the root [AccessibilityNodeInfo] of whatever
-     * app is currently in the foreground — in our case, Matiks. Because we
-     * restricted packageNames in the config, this should always be Matiks.
+     * Note: rootInActiveWindow is only fetched on the slow path, saving a
+     * Binder call on fast-path hits.
      */
     private fun inject(answer: Long): Boolean {
+        // ── Fast path: try cached nodes without fetching the root ─────────────
+        val (cachedInput, cachedSubmit) = synchronized(nodeCacheLock) {
+            Pair(cachedInputNode, cachedSubmitNode)
+        }
+
+        if (cachedInput != null && cachedInput.refresh() &&
+            cachedInput.isVisibleToUser && cachedInput.isEnabled) {
+
+            Log.d(TAG, "inject($answer): fast path (cached node)")
+            val ok = performInjection(cachedInput, cachedSubmit, answer)
+            if (ok) return true
+
+            // The cached node was alive (refresh() returned true) but the inject
+            // action was rejected. Reset cache and fall through to re-discover.
+            Log.w(TAG, "inject: cached node rejected — cache reset, retrying with tree search")
+            invalidateNodeCache()
+        }
+
+        // ── Slow path: fetch root and traverse ────────────────────────────────
         val root = rootInActiveWindow
         if (root == null) {
-            Log.w(TAG, "rootInActiveWindow is null — is Matiks in the foreground?")
+            Log.w(TAG, "inject: rootInActiveWindow is null — is Matiks in the foreground?")
             return false
         }
         return try {
-            injectIntoWindow(root, answer)
+            slowPathInject(root, answer)
         } finally {
-            @Suppress("DEPRECATION")
-            root.recycle()
+            @Suppress("DEPRECATION") root.recycle()
         }
     }
 
+    // -------------------------------------------------------------------------
+    // Injection helpers
+    // -------------------------------------------------------------------------
+
     /**
-     * Finds the input field, sets the answer text, then clicks Submit.
+     * Fast-path injection using pre-validated cached nodes.
      *
-     * Returns true only if ACTION_SET_TEXT succeeded. A false return means
-     * the input field wasn't found or the action was rejected by the app.
+     * Does NOT recycle [inputNode] or [submitNode] — they are owned by the
+     * cache and must remain valid for future fast-path injects.
      */
-    private fun injectIntoWindow(root: AccessibilityNodeInfo, answer: Long): Boolean {
-        // ── Step 1: Find the answer input ──────────────────────────────────────
+    private fun performInjection(
+        inputNode: AccessibilityNodeInfo,
+        submitNode: AccessibilityNodeInfo?,
+        answer: Long
+    ): Boolean {
+        val textSet = setAnswerText(inputNode, answer)
+        if (!textSet) return false
+
+        if (submitNode != null && submitNode.refresh() && submitNode.isEnabled) {
+            val clicked = submitNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            if (clicked) {
+                Log.d(TAG, "inject: submit clicked (cached button)")
+                return true
+            }
+        }
+        // Submit node is stale or missing — fall back to IME action on the input
+        return inputNode.performAction(AccessibilityNodeInfo.ACTION_IME_ENTER)
+    }
+
+    /**
+     * Slow-path injection: searches the tree, injects, then caches discovered nodes.
+     */
+    private fun slowPathInject(root: AccessibilityNodeInfo, answer: Long): Boolean {
+        Log.d(TAG, "inject: slow path (tree search)")
+
         val inputNode = findAnswerInput(root)
         if (inputNode == null) {
-            Log.w(TAG, "Answer input not found. Enable VERBOSE logging to see the node tree.")
+            Log.w(TAG, "inject: answer input not found — enable VERBOSE for tree dump")
             logNodeTree(root, label = "WINDOW TREE")
             return false
         }
 
         return try {
-            // ── Step 2: Set the answer text ────────────────────────────────────
-            //
-            // ACTION_SET_TEXT is more reliable than simulating keystrokes because:
-            //   - It works even if the field has focus restrictions
-            //   - It replaces the entire content atomically (no partial typing)
-            //   - It fires the app's TextWatcher correctly
-            //
-            // The argument must be a CharSequence in a Bundle — Android's
-            // accessibility framework uses Bundle to pass typed arguments.
-            val bundle = Bundle().apply {
-                putCharSequence(
-                    AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
-                    answer.toString()
-                )
-            }
-            val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, bundle)
-            Log.d(TAG, "ACTION_SET_TEXT '$answer': success=$textSet")
+            val textSet = setAnswerText(inputNode, answer)
+            if (!textSet) return false
 
-            if (!textSet) {
-                // Fallback: focus the field then paste from clipboard.
-                // Some WebView inputs reject ACTION_SET_TEXT but accept paste.
-                Log.w(TAG, "SET_TEXT failed — trying clipboard paste fallback")
-                pasteViaClipboard(inputNode, answer)
+            val submitNode = findSubmitNode(root)
+            val submitted  = if (submitNode != null) {
+                val clicked = submitNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                Log.d(TAG, "inject: submit clicked (slow path): $clicked")
+                clicked
+            } else {
+                Log.d(TAG, "inject: no submit button found — pressing IME action")
+                inputNode.performAction(AccessibilityNodeInfo.ACTION_IME_ENTER)
             }
 
-            // ── Step 3: Submit the answer ──────────────────────────────────────
-            val submitted = clickSubmit(root, inputNode)
-            Log.d(TAG, "Submit: success=$submitted")
+            if (submitted) {
+                // Cache both nodes. obtain() creates our own copy that won't be recycled
+                // by the framework until we explicitly recycle it.
+                synchronized(nodeCacheLock) {
+                    clearCachedNodesLocked()
+                    @Suppress("DEPRECATION")
+                    cachedInputNode  = AccessibilityNodeInfo.obtain(inputNode)
+                    @Suppress("DEPRECATION")
+                    cachedSubmitNode = submitNode?.let { AccessibilityNodeInfo.obtain(it) }
+                }
+                Log.d(TAG, "inject: nodes cached for future fast-path use")
+            }
 
-            textSet || submitted  // partial success counts
+            submitted
         } finally {
-            @Suppress("DEPRECATION")
-            inputNode.recycle()
+            @Suppress("DEPRECATION") inputNode.recycle()
+            @Suppress("DEPRECATION") submitNode?.recycle()
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Text injection
+    // -------------------------------------------------------------------------
+
+    /**
+     * Sets [answer] as the text of [inputNode] via ACTION_SET_TEXT.
+     * Falls back to clipboard paste for WebViews that reject ACTION_SET_TEXT.
+     */
+    private fun setAnswerText(inputNode: AccessibilityNodeInfo, answer: Long): Boolean {
+        val bundle = Bundle().apply {
+            putCharSequence(
+                AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+                answer.toString()
+            )
+        }
+        val textSet = inputNode.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, bundle)
+        Log.d(TAG, "ACTION_SET_TEXT '$answer': success=$textSet")
+
+        if (!textSet) {
+            Log.w(TAG, "SET_TEXT failed — trying clipboard paste fallback")
+            return pasteViaClipboard(inputNode, answer)
+        }
+        return true
     }
 
     // -------------------------------------------------------------------------
@@ -215,12 +322,11 @@ class NanoAccessibilityService : AccessibilityService() {
 
     /**
      * Finds the answer input field using three strategies in order of specificity.
+     *
+     * The returned node is a new copy owned by the caller — MUST be recycled.
      */
     private fun findAnswerInput(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
-        // Strategy 1: Known Matiks view IDs (fastest — O(1) lookup in the system's node cache)
-        // NOTE: Verify these IDs by running:
-        //   adb shell uiautomator dump /sdcard/ui.xml && adb pull /sdcard/ui.xml
-        // and looking for the answer input element's android:resource-id.
+        // Strategy 1: Known Matiks view IDs (fastest — O(1) lookup in system node cache)
         val knownIds = listOf("in.matiks:id/answer_input", "in.matiks:id/answerInput",
                               "in.matiks:id/answer", "in.matiks:id/input")
         for (id in knownIds) {
@@ -234,7 +340,6 @@ class NanoAccessibilityService : AccessibilityService() {
         }
 
         // Strategy 2: Any enabled, editable, visible field in the window.
-        // Works for native EditText and Chrome WebView text inputs alike.
         val editable = findNodeWithPredicate(root) { node ->
             node.isEditable && node.isEnabled && node.isVisibleToUser
         }
@@ -243,7 +348,7 @@ class NanoAccessibilityService : AccessibilityService() {
             return editable
         }
 
-        // Strategy 3: Hint text matching — useful for inputs that display placeholder text
+        // Strategy 3: Hint text matching — for inputs with placeholder text
         for (hint in listOf("answer", "type your answer", "enter answer", "?")) {
             val nodes = root.findAccessibilityNodeInfosByText(hint)
             val match = nodes.firstOrNull { it.isEditable || it.isEnabled }
@@ -258,10 +363,13 @@ class NanoAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Finds the submit button with three fallback strategies.
-     * If no button is found, tries pressing Enter on the input field itself.
+     * Finds the submit button using three strategies.
+     * Returns a node owned by the caller (must be recycled), or null.
+     *
+     * Extracted from [clickSubmit] in Phase 5 so the result can be
+     * cached separately from the action of clicking.
      */
-    private fun clickSubmit(root: AccessibilityNodeInfo, inputNode: AccessibilityNodeInfo): Boolean {
+    private fun findSubmitNode(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
         // Strategy 1: Known IDs
         val submitIds = listOf("in.matiks:id/submit", "in.matiks:id/submitButton",
                                "in.matiks:id/btn_submit", "in.matiks:id/check")
@@ -270,38 +378,52 @@ class NanoAccessibilityService : AccessibilityService() {
             if (nodes.isNotEmpty()) {
                 val node = nodes[0]
                 nodes.drop(1).forEach { @Suppress("DEPRECATION") it.recycle() }
-                val clicked = node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                @Suppress("DEPRECATION") node.recycle()
-                if (clicked) { Log.d(TAG, "Submit clicked by ID: $id"); return true }
+                Log.d(TAG, "Submit found by ID: $id")
+                return node
             }
         }
 
         // Strategy 2: Button with common submit label
         for (label in listOf("Submit", "Enter", "Check", "OK", "✓", "→")) {
             val nodes = root.findAccessibilityNodeInfosByText(label)
-            val btn = nodes.firstOrNull { it.isClickable && it.isEnabled }
+            val btn   = nodes.firstOrNull { it.isClickable && it.isEnabled }
             nodes.forEach { if (it !== btn) @Suppress("DEPRECATION") it.recycle() }
             if (btn != null) {
-                val clicked = btn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                @Suppress("DEPRECATION") btn.recycle()
-                if (clicked) { Log.d(TAG, "Submit clicked by label: '$label'"); return true }
+                Log.d(TAG, "Submit found by label: '$label'")
+                return btn
             }
         }
 
-        // Strategy 3: Clickable non-editable button anywhere in the tree
+        // Strategy 3: Generic clickable, non-editable node
         val btn = findNodeWithPredicate(root) { node ->
             node.isClickable && node.isEnabled && node.isVisibleToUser && !node.isEditable
         }
-        if (btn != null) {
-            val clicked = btn.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            @Suppress("DEPRECATION") btn.recycle()
-            if (clicked) { Log.d(TAG, "Submit clicked by generic button predicate"); return true }
-        }
+        if (btn != null) Log.d(TAG, "Submit found by generic button predicate")
+        return btn
+    }
 
-        // Fallback: press IME action (Enter key) on the input field itself.
-        // Many web forms submit on Enter, avoiding the need to find a separate button.
-        Log.d(TAG, "No submit button found — pressing IME action on input")
-        return inputNode.performAction(AccessibilityNodeInfo.ACTION_IME_ENTER)
+    // -------------------------------------------------------------------------
+    // Cache management
+    // -------------------------------------------------------------------------
+
+    /**
+     * Invalidates the cached node references and recycles them.
+     *
+     * Thread-safe: called from both the main thread (onAccessibilityEvent, onDestroy)
+     * and the coroutine thread (after a failed inject).
+     */
+    private fun invalidateNodeCache() {
+        synchronized(nodeCacheLock) {
+            clearCachedNodesLocked()
+        }
+    }
+
+    /** Must be called with [nodeCacheLock] held. */
+    private fun clearCachedNodesLocked() {
+        @Suppress("DEPRECATION") cachedInputNode?.recycle()
+        @Suppress("DEPRECATION") cachedSubmitNode?.recycle()
+        cachedInputNode  = null
+        cachedSubmitNode = null
     }
 
     // -------------------------------------------------------------------------
@@ -314,7 +436,7 @@ class NanoAccessibilityService : AccessibilityService() {
      * Steps:
      *   1. Write the answer to the clipboard.
      *   2. Focus the input node.
-     *   3. Select all existing text (so paste replaces it, not appends).
+     *   3. Select all existing text (so paste replaces, not appends).
      *   4. Paste from clipboard via ACTION_PASTE.
      */
     private fun pasteViaClipboard(inputNode: AccessibilityNodeInfo, answer: Long): Boolean {
@@ -341,9 +463,6 @@ class NanoAccessibilityService : AccessibilityService() {
      * This function recycles every intermediate node it visits. The returned
      * node is a fresh copy (via obtain) that the caller is responsible for
      * recycling when done.
-     *
-     * On API 33+, recycle() is deprecated and a no-op, but calling it is
-     * harmless and keeps the code compatible with API 27+.
      */
     private fun findNodeWithPredicate(
         node: AccessibilityNodeInfo,
@@ -356,8 +475,7 @@ class NanoAccessibilityService : AccessibilityService() {
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             val found = findNodeWithPredicate(child, predicate)
-            @Suppress("DEPRECATION")
-            child.recycle()
+            @Suppress("DEPRECATION") child.recycle()
             if (found != null) return found
         }
         return null
@@ -370,14 +488,6 @@ class NanoAccessibilityService : AccessibilityService() {
     /**
      * Logs the accessibility node tree up to [maxDepth] levels deep.
      * Enable with: adb logcat -s NanoA11y:V
-     *
-     * For each node, logs:
-     *   - Class name (e.g. android.widget.EditText, android.view.View)
-     *   - Resource ID  (e.g. in.matiks:id/answer_input)
-     *   - isEditable / isClickable flags
-     *   - Text content and hint text
-     *
-     * Use this output to identify the correct strategy and IDs for your Matiks version.
      */
     private fun logNodeTree(node: AccessibilityNodeInfo, depth: Int = 0,
                             maxDepth: Int = 6, label: String = "") {
@@ -395,8 +505,7 @@ class NanoAccessibilityService : AccessibilityService() {
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             logNodeTree(child, depth + 1, maxDepth)
-            @Suppress("DEPRECATION")
-            child.recycle()
+            @Suppress("DEPRECATION") child.recycle()
         }
     }
 }
