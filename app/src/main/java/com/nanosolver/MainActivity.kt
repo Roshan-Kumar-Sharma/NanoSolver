@@ -3,6 +3,7 @@ package com.nanosolver
 import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Activity
+import android.content.ComponentName
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
@@ -15,22 +16,24 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import androidx.core.net.toUri
+import com.nanosolver.service.NanoAccessibilityService
 import com.nanosolver.service.OverlayService
 
 /**
- * MainActivity — Phase 2
+ * MainActivity — Phase 5
  *
- * Manages a four-step permission chain before starting the solver:
+ * Five-step readiness chain before the solver runs at full capability:
  *
- *   Step 1 — SYSTEM_ALERT_WINDOW   (overlay, Settings redirect)
- *   Step 2 — POST_NOTIFICATIONS    (Android 13+, runtime dialog)
- *   Step 3 — Screen capture consent (MediaProjection dialog)
- *   Step 4 — Start OverlayService with the MediaProjection token
+ *   Step 1 — SYSTEM_ALERT_WINDOW        (overlay, Settings redirect)
+ *   Step 2 — POST_NOTIFICATIONS         (Android 13+, runtime dialog)
+ *   Step 3 — Accessibility service      (separate Settings redirect — Phase 5)
+ *   Step 4 — Screen capture consent     (MediaProjection dialog)
+ *   Step 5 — Start OverlayService       (with the token)
  *
- * WHY is MediaProjection consent done here and not in the service?
- *   createScreenCaptureIntent() must be launched from an Activity.
- *   Services have no window token and cannot show system dialogs.
- *   The Activity collects the token and hands it to the service via Intent extras.
+ * NOTE on accessibility service ordering:
+ *   The accessibility service can be enabled independently at any time — it's
+ *   not a blocking prerequisite for starting the solver. OCR + display still
+ *   works without it. We guide the user toward enabling it but don't force it.
  */
 class MainActivity : AppCompatActivity() {
 
@@ -38,38 +41,37 @@ class MainActivity : AppCompatActivity() {
     // Permission launchers
     // -------------------------------------------------------------------------
 
-    /** SYSTEM_ALERT_WINDOW: must be granted via a dedicated Settings screen. */
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { updateUI() }
 
-    /** POST_NOTIFICATIONS: standard runtime dialog (Android 13+ only). */
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { updateUI() }
 
     /**
-     * Screen capture consent — the most important launcher in Phase 2.
+     * Accessibility Settings launcher.
      *
-     * createScreenCaptureIntent() shows Android's system-level "Start recording?"
-     * dialog. If the user approves:
-     *   result.resultCode == RESULT_OK
-     *   result.data       == the MediaProjection grant Intent (the "token")
+     * WHY a separate Settings screen (again)?
+     * Like SYSTEM_ALERT_WINDOW, accessibility services cannot be enabled
+     * programmatically — Android requires explicit user consent via Settings.
+     * This is a security boundary: no app can grant itself the ability to read
+     * and control other apps' UIs without the user's deliberate action.
      *
-     * We pass both to the service. The service calls
-     * MediaProjectionManager.getMediaProjection(resultCode, data) to turn them
-     * into a live MediaProjection instance.
-     *
-     * If the user denies: resultCode == RESULT_CANCELED, data == null.
-     * We do nothing — the service is not started.
+     * We open Settings.ACTION_ACCESSIBILITY_SETTINGS which shows the list of
+     * installed accessibility services. The user taps "Nano Solver" → toggle ON.
      */
+    private val accessibilitySettingsLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { updateUI() }
+
     private val mediaProjectionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == Activity.RESULT_OK && result.data != null) {
             startSolverService(result.resultCode, result.data!!)
         } else {
-            updateUI()  // re-render button without starting anything
+            updateUI()
         }
     }
 
@@ -80,7 +82,14 @@ class MainActivity : AppCompatActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
+
         findViewById<Button>(R.id.btnToggleService).setOnClickListener { handleToggleClick() }
+
+        // Dedicated button that always opens Accessibility Settings regardless of other state.
+        // The user may want to enable/disable the service independently.
+        findViewById<Button>(R.id.btnAccessibilitySettings).setOnClickListener {
+            openAccessibilitySettings()
+        }
     }
 
     override fun onResume() {
@@ -94,18 +103,14 @@ class MainActivity : AppCompatActivity() {
 
     private fun handleToggleClick() {
         when {
-            // Step 1: overlay permission (Settings redirect)
             !Settings.canDrawOverlays(this) -> requestOverlayPermission()
-
-            // Step 2: notification permission (Android 13+ only)
-            needsNotificationPermission() -> requestNotificationPermission()
-
-            // If service is already running — stop it
-            OverlayService.isRunning -> stopSolverService()
-
-            // Step 3: screen capture consent → Step 4 happens in the launcher callback
-            else -> launchScreenCaptureConsent()
+            needsNotificationPermission()   -> requestNotificationPermission()
+            OverlayService.isRunning        -> stopSolverService()
+            else                            -> launchScreenCaptureConsent()
         }
+        // Note: accessibility service is NOT a blocking step in this chain.
+        // Injection won't work without it, but OCR + display still runs.
+        // The status row and dedicated button guide the user to enable it.
     }
 
     private fun requestOverlayPermission() {
@@ -121,26 +126,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     /**
-     * Shows the system "Start recording?" consent dialog.
+     * Opens the system Accessibility Settings list.
      *
-     * The MediaProjectionManager is a system service — it owns the consent
-     * dialog and hands back a signed Intent (the token) that only it can verify.
-     * There's no way to fake this grant, which is why screen capture is
-     * considered safe even without a root check.
+     * There is no API to jump directly to our service's toggle — we can only
+     * open the top-level Accessibility Settings page. The user finds "Nano Solver"
+     * in the list and enables it manually.
+     *
+     * On some manufacturer skins (MIUI, One UI) the path may be different:
+     *   MIUI:   Settings → Additional Settings → Accessibility → Installed services
+     *   One UI: Settings → Accessibility → Installed apps
      */
+    private fun openAccessibilitySettings() {
+        accessibilitySettingsLauncher.launch(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+    }
+
     private fun launchScreenCaptureConsent() {
         val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjectionLauncher.launch(manager.createScreenCaptureIntent())
     }
 
-    // Step 4: start the service with the token
     private fun startSolverService(resultCode: Int, data: Intent) {
         val intent = Intent(this, OverlayService::class.java).apply {
             putExtra(OverlayService.EXTRA_RESULT_CODE, resultCode)
             putExtra(OverlayService.EXTRA_PROJECTION_DATA, data)
         }
         startForegroundService(intent)
-        // Small delay so isRunning flag has time to be set before we refresh the UI
         findViewById<Button>(R.id.btnToggleService).postDelayed({ updateUI() }, 300)
     }
 
@@ -155,37 +165,79 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("SetTextI18n")
     private fun updateUI() {
-        val hasOverlay      = Settings.canDrawOverlays(this)
-        val hasNotification = !needsNotificationPermission()
-        val running         = OverlayService.isRunning
-        val capturing       = OverlayService.captureActive
+        val hasOverlay       = Settings.canDrawOverlays(this)
+        val hasNotification  = !needsNotificationPermission()
+        val hasAccessibility = isAccessibilityServiceEnabled()
+        val running          = OverlayService.isRunning
+        val capturing        = OverlayService.captureActive
 
         findViewById<TextView>(R.id.tvOverlayStatus).text =
-            "Overlay permission: ${if (hasOverlay) "Granted" else "Not granted"}"
+            "Overlay permission: ${if (hasOverlay) "✓ Granted" else "✗ Not granted"}"
 
         findViewById<TextView>(R.id.tvNotifStatus).text =
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
-                "Notification permission: ${if (hasNotification) "Granted" else "Not granted"}"
+                "Notification permission: ${if (hasNotification) "✓ Granted" else "✗ Not granted"}"
             else
-                "Notification permission: Not required (API < 33)"
+                "Notification permission: ✓ Not required (API < 33)"
 
         findViewById<TextView>(R.id.tvServiceStatus).text =
-            "Overlay service: ${if (running) "Running" else "Stopped"}"
+            "Overlay service: ${if (running) "✓ Running" else "○ Stopped"}"
 
         findViewById<TextView>(R.id.tvCaptureStatus).text =
-            "Screen capture: ${if (capturing) "Active" else "Inactive"}"
+            "Screen capture: ${if (capturing) "✓ Active" else "○ Inactive"}"
 
+        // Accessibility service status — shown with a note about what it enables
+        findViewById<TextView>(R.id.tvAccessibilityStatus).text =
+            if (hasAccessibility)
+                "Accessibility service: ✓ Enabled — auto-fill active"
+            else
+                "Accessibility service: ✗ Disabled — answers shown only, not auto-filled"
+
+        // Primary button
         findViewById<Button>(R.id.btnToggleService).text = when {
             !hasOverlay      -> "Grant Overlay Permission"
             !hasNotification -> "Grant Notification Permission"
             running          -> "Stop Solver"
             else             -> "Start Solver"
         }
+
+        // Secondary button: always visible, label changes with state
+        findViewById<Button>(R.id.btnAccessibilitySettings).text =
+            if (hasAccessibility) "Accessibility Settings" else "Enable Accessibility Service"
     }
+
+    // -------------------------------------------------------------------------
+    // Helpers
+    // -------------------------------------------------------------------------
 
     private fun needsNotificationPermission(): Boolean {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
         return ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
+    }
+
+    /**
+     * Checks whether NanoAccessibilityService is currently enabled in system settings.
+     *
+     * The system stores enabled accessibility services as a colon-separated string
+     * in Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES, e.g.:
+     *   "com.foo/.BarService:in.matiks/.GameService:com.nanosolver/.service.NanoAccessibilityService"
+     *
+     * We flatten our ComponentName to "com.nanosolver/.service.NanoAccessibilityService"
+     * and check if it appears anywhere in that string.
+     *
+     * WHY NOT just check NanoAccessibilityService.isEnabled?
+     *   The static flag is only set when the service process is running.
+     *   Settings.Secure reflects what the user toggled — even before the service
+     *   starts (e.g., on first launch after enabling it). Reading Settings is the
+     *   authoritative source.
+     */
+    private fun isAccessibilityServiceEnabled(): Boolean {
+        val enabledServices = Settings.Secure.getString(
+            contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: return false
+        val component = ComponentName(this, NanoAccessibilityService::class.java)
+        return enabledServices.contains(component.flattenToString(), ignoreCase = true)
     }
 }

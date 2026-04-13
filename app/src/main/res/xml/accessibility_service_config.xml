@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    AccessibilityService configuration — Phase 5
+
+    This file tells Android WHAT events our service wants and WHAT capabilities
+    it needs. The system reads it at service-bind time to grant the right access.
+
+    android:accessibilityEventTypes
+        Which UI events we receive in onAccessibilityEvent().
+        typeWindowStateChanged  — fires when a new Activity/Dialog opens. We use
+                                  this to reset state when Matiks navigates screens.
+        typeWindowContentChanged — fires when any view's content changes (text
+                                   updated, view added/removed). This fires after
+                                   Matiks renders a new math problem.
+
+        WHY NOT subscribe to everything?
+        Each event fires a Binder IPC from the target app's process to ours.
+        Subscribing to all event types on all apps would flood our service with
+        thousands of events per second. Restricting to these two keeps it quiet.
+
+    android:packageNames
+        Restrict events to Matiks only. Our service receives ZERO events from
+        any other app — no privacy implications, no performance cost.
+
+        HOW TO FIND THE PACKAGE NAME OF ANY APP:
+          1. Install the app and open it.
+          2. Run: adb shell dumpsys window windows | grep mCurrentFocus
+             Output example: mCurrentFocus=Window{... in.matiks/...}
+          3. The segment before "/" is the package name.
+
+        NOTE: If you play Matiks in a browser, change this to the browser's
+        package name (e.g. "com.android.chrome"). In that case, canRetrieveWindowContent
+        will give you the WebView's accessibility tree instead of a native one.
+
+    android:canRetrieveWindowContent="true"
+        Without this, performAction() calls (ACTION_SET_TEXT, ACTION_CLICK) are
+        silently ignored. This is the flag that allows reading AND writing to
+        another app's window. It's why users see an "Observe and control actions"
+        warning when enabling any accessibility service.
+
+    android:accessibilityFlags="flagReportViewIds"
+        Tells the system to include android:id resource names in AccessibilityNodeInfo.
+        Without this, node.viewIdResourceName is always null — making it impossible
+        to find nodes by ID. Useful for debugging with the Layout Inspector.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds"
+    android:canRetrieveWindowContent="true"
+    android:description="@string/accessibility_service_description"
+    android:packageNames="in.matiks" />

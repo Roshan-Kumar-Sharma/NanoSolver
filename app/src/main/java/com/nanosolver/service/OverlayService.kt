@@ -27,6 +27,7 @@ import com.nanosolver.capture.ScreenCaptureManager
 import com.nanosolver.ocr.ImagePreprocessor
 import com.nanosolver.ocr.TextExtractor
 import com.nanosolver.solver.MathParser
+import com.nanosolver.service.NanoAccessibilityService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -41,7 +42,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  *  1. Shows the draggable floating "▶ Solver" overlay (from Phase 1).
  *  2. Runs the MediaProjection → VirtualDisplay → ImageReader capture pipeline.
  *
- * PHASE 3 ADDITIONS vs PHASE 2:
+ * PHASE 3+5 ADDITIONS vs PHASE 2:
  *
  * E. CoroutineScope (serviceScope): Owns all coroutines launched by this service.
  *    Uses SupervisorJob so a failed OCR coroutine doesn't cancel the whole scope.
@@ -242,9 +243,12 @@ class OverlayService : Service() {
                 if (rawText.isNotBlank()) {
                     val answer = mathParser.solve(rawText)
                     if (answer != null) {
-                        // Show the answer on the overlay button (main thread required for UI)
+                        // Inject first (before showing on overlay) so the answer is
+                        // in the input field as quickly as possible. NanoAccessibilityService
+                        // runs its own Binder IPC (~1–3ms) — still much faster than the user.
+                        NanoAccessibilityService.injectAnswer(answer)
+                        // Update overlay UI (must run on the main thread)
                         Handler(Looper.getMainLooper()).post { showAnswer(answer) }
-                        // TODO Phase 5: accessibilityService.injectAnswer(answer)
                     }
                 }
 

@@ -46,15 +46,34 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textSize="15sp"
-        android:layout_marginBottom="32dp"
+        android:layout_marginBottom="8dp"
         android:text="Screen capture: checking…" />
 
-    <!-- Single action button: label changes based on current state -->
+    <!-- Phase 5: shows whether the accessibility service is enabled -->
+    <TextView
+        android:id="@+id/tvAccessibilityStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="15sp"
+        android:layout_marginBottom="32dp"
+        android:text="Accessibility service: checking…" />
+
+    <!-- Primary action: walks through all permissions then starts the solver -->
     <Button
         android:id="@+id/btnToggleService"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:text="Start Solver"
-        android:textSize="16sp" />
+        android:textSize="16sp"
+        android:layout_marginBottom="12dp" />
+
+    <!-- Secondary action: opens system Accessibility Settings -->
+    <Button
+        android:id="@+id/btnAccessibilitySettings"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Enable Accessibility Service"
+        android:textSize="14sp"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton" />
 
 </LinearLayout>

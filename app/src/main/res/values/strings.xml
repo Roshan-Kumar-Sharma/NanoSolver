@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Nano Solver</string>
+    <string name="accessibility_service_description">Nano Solver reads the Matiks game screen and automatically inputs calculated answers into the answer field.</string>
 </resources>

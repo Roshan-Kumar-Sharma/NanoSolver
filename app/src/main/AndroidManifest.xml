@@ -59,6 +59,33 @@
             android:foregroundServiceType="mediaProjection"
             android:exported="false" />
 
+        <!--
+            NanoAccessibilityService — Phase 5
+
+            BIND_ACCESSIBILITY_SERVICE: only the Android system may bind to this
+            service. Without android:permission, any app could bind and hijack
+            our accessibility events. This is mandatory for security.
+
+            android:exported="true": the system (not our app) starts this service,
+            so it must be exported. The BIND_ACCESSIBILITY_SERVICE permission
+            ensures only the system can actually bind it.
+
+            The <meta-data> element points to res/xml/accessibility_service_config.xml
+            which declares what events we receive and what capabilities we need.
+        -->
+        <service
+            android:name=".service.NanoAccessibilityService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/accessibility_service_config" />
+        </service>
+
     </application>
 
 </manifest>
