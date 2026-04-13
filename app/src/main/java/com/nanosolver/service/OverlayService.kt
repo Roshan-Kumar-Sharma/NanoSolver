@@ -24,30 +24,38 @@ import android.view.WindowManager
 import android.widget.Button
 import androidx.core.app.NotificationCompat
 import com.nanosolver.capture.ScreenCaptureManager
+import com.nanosolver.ocr.ImagePreprocessor
+import com.nanosolver.ocr.TextExtractor
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * OverlayService — Phase 2
+ * OverlayService — Phase 3
  *
  * Now does two things:
  *  1. Shows the draggable floating "▶ Solver" overlay (from Phase 1).
  *  2. Runs the MediaProjection → VirtualDisplay → ImageReader capture pipeline.
  *
- * PHASE 2 ADDITIONS vs PHASE 1:
+ * PHASE 3 ADDITIONS vs PHASE 2:
  *
- * A. The service is ONLY started after the user approves screen sharing.
- *    MainActivity launches the consent dialog, gets back a result code + data Intent,
- *    and passes both as extras when calling startForegroundService().
+ * E. CoroutineScope (serviceScope): Owns all coroutines launched by this service.
+ *    Uses SupervisorJob so a failed OCR coroutine doesn't cancel the whole scope.
+ *    Cancelled in onDestroy() to stop any in-flight work cleanly.
  *
- * B. startForeground() now passes FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION on API 29+.
- *    On API 34 this is what satisfies the "project_media" permission requirement.
- *    It MUST be called before MediaProjectionManager.getMediaProjection().
+ * F. ImagePreprocessor: grayscale + Otsu threshold each frame before OCR.
  *
- * C. MediaProjection.Callback handles the case where the user revokes capture
- *    mid-session (by dismissing the screen-share notification from the shade).
+ * G. TextExtractor: ML Kit recognizer wrapped as a suspend function.
  *
- * D. START_NOT_STICKY: the service must NOT auto-restart. If the OS kills it,
- *    a new MediaProjection token is required — the old one becomes invalid.
- *    The user must tap "Start Solver" again to re-consent.
+ * H. ocrBusy (AtomicBoolean): prevents frame-queuing.
+ *    WHY: ML Kit inference takes ~50–120ms. At 30fps a new frame arrives every
+ *    ~33ms. Without a gate, we'd launch 3–4 parallel OCR jobs per second, each
+ *    holding a Bitmap in memory. The gate ensures at most one OCR job runs at
+ *    a time; frames that arrive while OCR is busy are dropped (recycled).
+ *    This is intentional — we always want the LATEST frame, not a backlog.
  */
 class OverlayService : Service() {
 
@@ -64,7 +72,19 @@ class OverlayService : Service() {
         @Volatile var captureActive: Boolean = false; private set
     }
 
+    // CoroutineScope tied to this service's lifetime.
+    // SupervisorJob: if one OCR coroutine throws, others keep running.
+    // Dispatchers.Default: runs on the shared CPU thread pool — keeps main thread free.
+    private val serviceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    // Prevents more than one OCR job running at once (see phase note H above).
+    // AtomicBoolean is thread-safe: compareAndSet(false, true) is an atomic
+    // "check + flip" that can't be interrupted between threads.
+    private val ocrBusy = AtomicBoolean(false)
+
     private lateinit var windowManager: WindowManager
+    private lateinit var imagePreprocessor: ImagePreprocessor
+    private lateinit var textExtractor: TextExtractor
     private var overlayButton: View? = null
     private var captureManager: ScreenCaptureManager? = null
     private var mediaProjection: MediaProjection? = null
@@ -76,7 +96,9 @@ class OverlayService : Service() {
     override fun onCreate() {
         super.onCreate()
         isRunning = true
-        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+        windowManager     = getSystemService(WINDOW_SERVICE) as WindowManager
+        imagePreprocessor = ImagePreprocessor()
+        textExtractor     = TextExtractor()
         createNotificationChannel()
     }
 
@@ -125,6 +147,8 @@ class OverlayService : Service() {
         super.onDestroy()
         isRunning     = false
         captureActive = false
+        serviceScope.cancel()   // cancels all in-flight OCR coroutines
+        textExtractor.close()   // releases TFLite model from memory
         stopCapture()
         removeOverlay()
         Log.i(TAG, "Service destroyed")
@@ -176,18 +200,55 @@ class OverlayService : Service() {
     }
 
     /**
-     * Called on the CaptureThread for each new frame.
+     * Called on the CaptureThread for each new screen frame.
      *
-     * Phase 2: just log dimensions to confirm frames are arriving.
-     * Phase 3: pass [bitmap] to TextExtractor for OCR.
+     * The ocrBusy gate prevents frame queuing:
+     *   - compareAndSet(false, true) atomically flips the flag to true only if
+     *     it was false. If another OCR job is running (flag already true), this
+     *     call returns false and we drop the frame immediately.
+     *   - The finally block always resets the flag so the next frame can proceed.
      *
-     * IMPORTANT: always recycle the bitmap when done. If you don't, the heap
-     * fills up within seconds at 30+ fps.
+     * FULL PIPELINE (Phase 3):
+     *   Raw frame → preprocess (grayscale + threshold) → ML Kit OCR → log text
+     *   Phase 4 will add:  → MathParser.solve(text) → answer
+     *   Phase 5 will add:  → AccessibilityService.inject(answer)
      */
     private fun handleFrame(bitmap: Bitmap) {
-        Log.v(TAG, "Frame: ${bitmap.width}x${bitmap.height}")
-        // Phase 3 will replace this with: textExtractor.process(bitmap)
-        bitmap.recycle()
+        if (!ocrBusy.compareAndSet(false, true)) {
+            // OCR is still running from the previous frame. Drop this frame.
+            bitmap.recycle()
+            return
+        }
+
+        // Launch on Dispatchers.Default (already the service scope's dispatcher).
+        // The frame bitmap is handed off to this coroutine; we don't touch it after.
+        serviceScope.launch {
+            try {
+                // Step 1: Preprocess — grayscale + Otsu threshold
+                // Runs on CPU (Dispatchers.Default). ~5ms for a 1080p frame.
+                val preprocessed = imagePreprocessor.preprocess(bitmap)
+                bitmap.recycle()   // original no longer needed
+
+                // Step 2: OCR — ML Kit TFLite inference
+                // .await() suspends this coroutine until ML Kit finishes (~50–120ms).
+                // The thread is NOT blocked — other coroutines can run during this time.
+                val rawText = textExtractor.extract(preprocessed)
+                preprocessed.recycle()
+
+                // Step 3: Pass to solver (Phase 4)
+                if (rawText.isNotBlank()) {
+                    Log.d(TAG, "OCR result: '$rawText'")
+                    // TODO Phase 4: val answer = mathParser.solve(rawText)
+                }
+
+            } catch (e: Exception) {
+                Log.e(TAG, "Frame pipeline error: ${e.message}")
+                // Don't crash the service over a single bad frame
+            } finally {
+                // Always release the gate so the next frame can be processed.
+                ocrBusy.set(false)
+            }
+        }
     }
 
     // -------------------------------------------------------------------------

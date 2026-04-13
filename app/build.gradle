@@ -40,4 +40,25 @@ dependencies {
     implementation 'androidx.core:core-ktx:1.12.0'
     implementation 'androidx.appcompat:appcompat:1.6.1'
     implementation 'com.google.android.material:material:1.10.0'
+
+    // -------------------------------------------------------------------------
+    // Phase 3: OCR
+    // -------------------------------------------------------------------------
+
+    // ML Kit Text Recognition (Latin script — covers all digits and operators).
+    // Runs on-device via TFLite; uses the device's NNAPI (DSP/NPU) when available.
+    // No network required after first download.
+    implementation 'com.google.mlkit:text-recognition:16.0.1'
+
+    // -------------------------------------------------------------------------
+    // Coroutines
+    // -------------------------------------------------------------------------
+
+    // Core coroutines + Android-specific dispatchers (Dispatchers.Main)
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3'
+
+    // Provides Task<T>.await() — bridges Google's Task API (used by ML Kit)
+    // with Kotlin coroutines. Lets us write: val text = recognizer.process(img).await()
+    // instead of manually wiring addOnSuccessListener / addOnFailureListener callbacks.
+    implementation 'org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3'
 }
