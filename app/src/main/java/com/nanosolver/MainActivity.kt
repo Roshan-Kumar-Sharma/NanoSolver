@@ -1,10 +1,11 @@
 package com.nanosolver
 
 import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
-import android.annotation.SuppressLint
-import androidx.core.net.toUri
+import android.media.projection.MediaProjectionManager
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
@@ -13,90 +14,104 @@ import android.widget.TextView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.net.toUri
 import com.nanosolver.service.OverlayService
 
+/**
+ * MainActivity — Phase 2
+ *
+ * Manages a four-step permission chain before starting the solver:
+ *
+ *   Step 1 — SYSTEM_ALERT_WINDOW   (overlay, Settings redirect)
+ *   Step 2 — POST_NOTIFICATIONS    (Android 13+, runtime dialog)
+ *   Step 3 — Screen capture consent (MediaProjection dialog)
+ *   Step 4 — Start OverlayService with the MediaProjection token
+ *
+ * WHY is MediaProjection consent done here and not in the service?
+ *   createScreenCaptureIntent() must be launched from an Activity.
+ *   Services have no window token and cannot show system dialogs.
+ *   The Activity collects the token and hands it to the service via Intent extras.
+ */
 class MainActivity : AppCompatActivity() {
 
     // -------------------------------------------------------------------------
     // Permission launchers
-    //
-    // Android's modern permission API uses ActivityResultLauncher instead of
-    // onActivityResult(). Each launcher is tied to a specific contract type.
     // -------------------------------------------------------------------------
 
-    /**
-     * Launcher for SYSTEM_ALERT_WINDOW (overlay permission).
-     *
-     * WHY a separate Settings screen?
-     * SYSTEM_ALERT_WINDOW is a "special" permission — unlike camera or location,
-     * it cannot be granted via the standard runtime dialog. The user must manually
-     * toggle it in Settings. This is because an overlay can cover the entire screen,
-     * making it a higher-risk permission that Android wants explicit user intent for.
-     */
+    /** SYSTEM_ALERT_WINDOW: must be granted via a dedicated Settings screen. */
     private val overlayPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
-    ) {
-        // The result code is always RESULT_CANCELED for Settings screens, so we
-        // re-check the actual permission state rather than trusting resultCode.
-        updateUI()
-    }
+    ) { updateUI() }
 
-    /**
-     * Launcher for POST_NOTIFICATIONS (Android 13+).
-     *
-     * WHY is this needed?
-     * On API 33+, showing any notification requires explicit user permission.
-     * Our foreground service needs a notification to keep the service alive
-     * (Android mandates this as a user-visible signal that the app is running).
-     */
+    /** POST_NOTIFICATIONS: standard runtime dialog (Android 13+ only). */
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) {
-        updateUI()
+    ) { updateUI() }
+
+    /**
+     * Screen capture consent — the most important launcher in Phase 2.
+     *
+     * createScreenCaptureIntent() shows Android's system-level "Start recording?"
+     * dialog. If the user approves:
+     *   result.resultCode == RESULT_OK
+     *   result.data       == the MediaProjection grant Intent (the "token")
+     *
+     * We pass both to the service. The service calls
+     * MediaProjectionManager.getMediaProjection(resultCode, data) to turn them
+     * into a live MediaProjection instance.
+     *
+     * If the user denies: resultCode == RESULT_CANCELED, data == null.
+     * We do nothing — the service is not started.
+     */
+    private val mediaProjectionLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK && result.data != null) {
+            startSolverService(result.resultCode, result.data!!)
+        } else {
+            updateUI()  // re-render button without starting anything
+        }
     }
+
+    // -------------------------------------------------------------------------
+    // Activity lifecycle
+    // -------------------------------------------------------------------------
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
-
-        findViewById<Button>(R.id.btnToggleService).setOnClickListener {
-            handleToggleClick()
-        }
+        findViewById<Button>(R.id.btnToggleService).setOnClickListener { handleToggleClick() }
     }
 
     override fun onResume() {
         super.onResume()
-        // Refresh UI every time the Activity comes back to the foreground.
-        // This covers the case where the user returns from the Settings screen.
         updateUI()
     }
 
     // -------------------------------------------------------------------------
-    // Core logic
+    // Permission chain
     // -------------------------------------------------------------------------
 
     private fun handleToggleClick() {
         when {
-            // Step 1: Ensure overlay permission is granted first.
+            // Step 1: overlay permission (Settings redirect)
             !Settings.canDrawOverlays(this) -> requestOverlayPermission()
 
-            // Step 2: On Android 13+, ensure notification permission is granted.
-            // Without a notification, startForegroundService() will crash.
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
-                != PackageManager.PERMISSION_GRANTED -> requestNotificationPermission()
+            // Step 2: notification permission (Android 13+ only)
+            needsNotificationPermission() -> requestNotificationPermission()
 
-            // Step 3: All permissions granted — toggle the service.
-            else -> toggleService()
+            // If service is already running — stop it
+            OverlayService.isRunning -> stopSolverService()
+
+            // Step 3: screen capture consent → Step 4 happens in the launcher callback
+            else -> launchScreenCaptureConsent()
         }
     }
 
     private fun requestOverlayPermission() {
-        val intent = Intent(
-            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-            "package:$packageName".toUri()
+        overlayPermissionLauncher.launch(
+            Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION, "package:$packageName".toUri())
         )
-        overlayPermissionLauncher.launch(intent)
     }
 
     private fun requestNotificationPermission() {
@@ -105,17 +120,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun toggleService() {
-        val intent = Intent(this, OverlayService::class.java)
-        if (OverlayService.isRunning) {
-            stopService(intent)
-        } else {
-            // startForegroundService() is required on API 26+ when the service
-            // will call startForeground() within 5 seconds of starting.
-            // Using startService() instead would cause an ANR crash on API 26+.
-            startForegroundService(intent)
+    /**
+     * Shows the system "Start recording?" consent dialog.
+     *
+     * The MediaProjectionManager is a system service — it owns the consent
+     * dialog and hands back a signed Intent (the token) that only it can verify.
+     * There's no way to fake this grant, which is why screen capture is
+     * considered safe even without a root check.
+     */
+    private fun launchScreenCaptureConsent() {
+        val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+        mediaProjectionLauncher.launch(manager.createScreenCaptureIntent())
+    }
+
+    // Step 4: start the service with the token
+    private fun startSolverService(resultCode: Int, data: Intent) {
+        val intent = Intent(this, OverlayService::class.java).apply {
+            putExtra(OverlayService.EXTRA_RESULT_CODE, resultCode)
+            putExtra(OverlayService.EXTRA_PROJECTION_DATA, data)
         }
-        // Give the service a moment to update its isRunning flag, then refresh.
+        startForegroundService(intent)
+        // Small delay so isRunning flag has time to be set before we refresh the UI
+        findViewById<Button>(R.id.btnToggleService).postDelayed({ updateUI() }, 300)
+    }
+
+    private fun stopSolverService() {
+        stopService(Intent(this, OverlayService::class.java))
         findViewById<Button>(R.id.btnToggleService).postDelayed({ updateUI() }, 200)
     }
 
@@ -123,37 +153,39 @@ class MainActivity : AppCompatActivity() {
     // UI state
     // -------------------------------------------------------------------------
 
-    // @SuppressLint: these are developer-facing status strings, not user-visible
-    // translated content — moving them to string resources adds no real value here.
     @SuppressLint("SetTextI18n")
     private fun updateUI() {
-        val hasOverlay = Settings.canDrawOverlays(this)
-        val hasNotification = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
-            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) ==
-                PackageManager.PERMISSION_GRANTED
-        val running = OverlayService.isRunning
+        val hasOverlay      = Settings.canDrawOverlays(this)
+        val hasNotification = !needsNotificationPermission()
+        val running         = OverlayService.isRunning
+        val capturing       = OverlayService.captureActive
 
-        // Permission status lines
         findViewById<TextView>(R.id.tvOverlayStatus).text =
             "Overlay permission: ${if (hasOverlay) "Granted" else "Not granted"}"
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            findViewById<TextView>(R.id.tvNotifStatus).text =
+        findViewById<TextView>(R.id.tvNotifStatus).text =
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
                 "Notification permission: ${if (hasNotification) "Granted" else "Not granted"}"
-        } else {
-            findViewById<TextView>(R.id.tvNotifStatus).text =
+            else
                 "Notification permission: Not required (API < 33)"
-        }
 
         findViewById<TextView>(R.id.tvServiceStatus).text =
             "Overlay service: ${if (running) "Running" else "Stopped"}"
 
-        // Button label reflects the next action the user should take
+        findViewById<TextView>(R.id.tvCaptureStatus).text =
+            "Screen capture: ${if (capturing) "Active" else "Inactive"}"
+
         findViewById<Button>(R.id.btnToggleService).text = when {
-            !hasOverlay       -> "Grant Overlay Permission"
-            !hasNotification  -> "Grant Notification Permission"
-            running           -> "Stop Overlay"
-            else              -> "Start Overlay"
+            !hasOverlay      -> "Grant Overlay Permission"
+            !hasNotification -> "Grant Notification Permission"
+            running          -> "Stop Solver"
+            else             -> "Start Solver"
         }
+    }
+
+    private fun needsNotificationPermission(): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
+        return ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
     }
 }

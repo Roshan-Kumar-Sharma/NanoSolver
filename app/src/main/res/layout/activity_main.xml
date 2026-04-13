@@ -15,7 +15,7 @@
         android:textStyle="bold"
         android:layout_marginBottom="32dp" />
 
-    <!-- Permission status readouts -->
+    <!-- Permission + service status readouts -->
     <TextView
         android:id="@+id/tvOverlayStatus"
         android:layout_width="match_parent"
@@ -37,15 +37,24 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:textSize="15sp"
-        android:layout_marginBottom="32dp"
+        android:layout_marginBottom="8dp"
         android:text="Overlay service: checking…" />
+
+    <!-- Phase 2: shows whether the capture pipeline is active -->
+    <TextView
+        android:id="@+id/tvCaptureStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="15sp"
+        android:layout_marginBottom="32dp"
+        android:text="Screen capture: checking…" />
 
     <!-- Single action button: label changes based on current state -->
     <Button
         android:id="@+id/btnToggleService"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="Start Overlay"
+        android:text="Start Solver"
         android:textSize="16sp" />
 
 </LinearLayout>
