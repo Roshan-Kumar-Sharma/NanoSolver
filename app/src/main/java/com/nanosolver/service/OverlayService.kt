@@ -26,6 +26,7 @@ import androidx.core.app.NotificationCompat
 import com.nanosolver.capture.ScreenCaptureManager
 import com.nanosolver.ocr.ImagePreprocessor
 import com.nanosolver.ocr.TextExtractor
+import com.nanosolver.solver.MathParser
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -85,6 +86,7 @@ class OverlayService : Service() {
     private lateinit var windowManager: WindowManager
     private lateinit var imagePreprocessor: ImagePreprocessor
     private lateinit var textExtractor: TextExtractor
+    private lateinit var mathParser: MathParser
     private var overlayButton: View? = null
     private var captureManager: ScreenCaptureManager? = null
     private var mediaProjection: MediaProjection? = null
@@ -99,6 +101,7 @@ class OverlayService : Service() {
         windowManager     = getSystemService(WINDOW_SERVICE) as WindowManager
         imagePreprocessor = ImagePreprocessor()
         textExtractor     = TextExtractor()
+        mathParser        = MathParser()
         createNotificationChannel()
     }
 
@@ -235,10 +238,14 @@ class OverlayService : Service() {
                 val rawText = textExtractor.extract(preprocessed)
                 preprocessed.recycle()
 
-                // Step 3: Pass to solver (Phase 4)
+                // Step 3: Solve — recursive descent parser, ~0.1ms
                 if (rawText.isNotBlank()) {
-                    Log.d(TAG, "OCR result: '$rawText'")
-                    // TODO Phase 4: val answer = mathParser.solve(rawText)
+                    val answer = mathParser.solve(rawText)
+                    if (answer != null) {
+                        // Show the answer on the overlay button (main thread required for UI)
+                        Handler(Looper.getMainLooper()).post { showAnswer(answer) }
+                        // TODO Phase 5: accessibilityService.injectAnswer(answer)
+                    }
                 }
 
             } catch (e: Exception) {
@@ -297,10 +304,30 @@ class OverlayService : Service() {
         (overlayButton as? Button)?.apply {
             text = if (captureActive) "● Solving" else "▶ Solver"
             setBackgroundColor(
-                if (captureActive) Color.parseColor("#2E7D32")   // green when capturing
-                else               Color.parseColor("#1565C0")   // blue when idle
+                if (captureActive) Color.parseColor("#2E7D32")
+                else               Color.parseColor("#1565C0")
             )
         }
+    }
+
+    /**
+     * Displays the computed answer on the overlay button.
+     *
+     * Shows the answer for 1.5 seconds (long enough to read and type it),
+     * then reverts back to "● Solving" so it's clear the solver is still running.
+     *
+     * Must be called on the main thread — WindowManager.updateViewLayout() is
+     * not thread-safe. We post() to the main handler from the coroutine.
+     */
+    private fun showAnswer(answer: Long) {
+        val button = overlayButton as? Button ?: return
+        button.text = "= $answer"
+        button.setBackgroundColor(Color.parseColor("#E65100"))  // deep orange = answer ready
+
+        // Revert to "solving" state after 1.5s so the user knows we're still running
+        button.postDelayed({
+            if (captureActive) updateOverlayButtonState()
+        }, 1500)
     }
 
     private fun buildLayoutParams(): WindowManager.LayoutParams {
