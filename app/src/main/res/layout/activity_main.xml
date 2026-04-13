@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:padding="24dp"
+    android:gravity="center_vertical">
+
+    <TextView
+        android:text="Nano Solver"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="28sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="32dp" />
+
+    <!-- Permission status readouts -->
+    <TextView
+        android:id="@+id/tvOverlayStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="15sp"
+        android:layout_marginBottom="8dp"
+        android:text="Overlay permission: checking…" />
+
+    <TextView
+        android:id="@+id/tvNotifStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="15sp"
+        android:layout_marginBottom="8dp"
+        android:text="Notification permission: checking…" />
+
+    <TextView
+        android:id="@+id/tvServiceStatus"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:textSize="15sp"
+        android:layout_marginBottom="32dp"
+        android:text="Overlay service: checking…" />
+
+    <!-- Single action button: label changes based on current state -->
+    <Button
+        android:id="@+id/btnToggleService"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Start Overlay"
+        android:textSize="16sp" />
+
+</LinearLayout>

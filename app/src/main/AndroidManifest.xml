@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+        SYSTEM_ALERT_WINDOW: Required to draw the floating overlay on top of other apps.
+        This is NOT requested via the normal runtime permission dialog — the user must be
+        sent to a special Settings screen (Settings.ACTION_MANAGE_OVERLAY_PERMISSION).
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <!--
+        FOREGROUND_SERVICE: Required to run OverlayService as a foreground service.
+        Without this, Android can kill the service when memory is low. Foreground services
+        must show a persistent notification so the user knows the app is actively running.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+
+    <!--
+        FOREGROUND_SERVICE_MEDIA_PROJECTION: Required on API 34+ when a foreground service
+        uses android:foregroundServiceType="mediaProjection". Declared now so the app is
+        ready for Phase 2 (screen capture) without a manifest change.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+
+    <!--
+        POST_NOTIFICATIONS: Required on API 33+ (Android 13+) to show notifications at all.
+        Since our minSdk is 27, the code handles requesting this at runtime.
+    -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.NanoSolver">
+
+        <!-- The only Activity: shows permission status and a start/stop button -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+            OverlayService runs as a foreground service.
+            foregroundServiceType="mediaProjection" is declared here to be ready for Phase 2.
+            android:exported="false" means no other app can start this service directly.
+        -->
+        <service
+            android:name=".service.OverlayService"
+            android:foregroundServiceType="mediaProjection"
+            android:exported="false" />
+
+    </application>
+
+</manifest>
