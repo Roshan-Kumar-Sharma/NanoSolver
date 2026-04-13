@@ -27,6 +27,7 @@ import com.nanosolver.ocr.ImagePreprocessor
 import com.nanosolver.ocr.TextExtractor
 import com.nanosolver.pipeline.CaptureConfig
 import com.nanosolver.pipeline.LatencyStats
+import com.nanosolver.pipeline.RegionConfig
 import com.nanosolver.pipeline.SolverPipeline
 import com.nanosolver.solver.MathParser
 import kotlinx.coroutines.CoroutineScope
@@ -77,7 +78,14 @@ class OverlayService : Service() {
     private lateinit var mathParser:       MathParser
     private lateinit var solverPipeline:   SolverPipeline
 
-    private var overlayButton:  View? = null
+    // Screen dimensions — stored once in onCreate() for the region selector.
+    private var screenWidth  = 0
+    private var screenHeight = 0
+
+    private var overlayButton:        View? = null
+    private var resetButton:          View? = null
+    private var regionButton:         View? = null
+    private var regionSelectorOverlay: RegionSelectorOverlay? = null
     private var captureManager: ScreenCaptureManager? = null
     private var mediaProjection: MediaProjection? = null
 
@@ -93,10 +101,14 @@ class OverlayService : Service() {
         textExtractor     = TextExtractor()
         mathParser        = MathParser()
 
-        // Screen dimensions for the capture region rect computation (Phase 7).
-        // These are stable for the service lifetime — display metrics don't change
-        // unless the user rotates, which stops the capture anyway.
+        // Screen dimensions — stored as fields for the region selector and pipeline.
+        // Stable for the service lifetime (rotation stops capture before it changes).
         val metrics = resources.displayMetrics
+        screenWidth  = metrics.widthPixels
+        screenHeight = metrics.heightPixels
+
+        // Load the persisted region config (falls back to defaults on first run).
+        val regionConfig = RegionConfig.load(this)
 
         // Build the pipeline. Injection happens inside SolverPipeline (Stage 4).
         // The onAnswer callback runs on Dispatchers.Default after inject completes;
@@ -106,9 +118,9 @@ class OverlayService : Service() {
             preprocessor  = imagePreprocessor,
             extractor     = textExtractor,
             parser        = mathParser,
-            config        = CaptureConfig(),   // defaults: 25–55% of screen, 720px OCR width
-            screenWidth   = metrics.widthPixels,
-            screenHeight  = metrics.heightPixels
+            config        = regionConfig.toCaptureConfig(),
+            screenWidth   = screenWidth,
+            screenHeight  = screenHeight
         ) { answer, stats ->
             Handler(Looper.getMainLooper()).post {
                 showAnswer(answer, stats)
@@ -238,10 +250,29 @@ class OverlayService : Service() {
 
     private fun showOverlay() {
         if (overlayButton != null) return
+
         val params = buildLayoutParams()
         val button = buildOverlayButton(params)
         overlayButton = button
         windowManager.addView(button, params)
+
+        // Reset button (↺) — directly below the solver button.
+        val resetParams = buildLayoutParams().apply {
+            x = 50
+            y = 300 + dpToPx(44) + dpToPx(8)
+        }
+        val rb = buildResetButton()
+        resetButton = rb
+        windowManager.addView(rb, resetParams)
+
+        // Region selector button (⊞) — directly below the reset button.
+        val regionParams = buildLayoutParams().apply {
+            x = 50
+            y = 300 + dpToPx(44) + dpToPx(8) + dpToPx(44) + dpToPx(8)
+        }
+        val regBtn = buildRegionButton()
+        regionButton = regBtn
+        windowManager.addView(regBtn, regionParams)
     }
 
     /**
@@ -356,11 +387,79 @@ class OverlayService : Service() {
     }
 
     private fun removeOverlay() {
-        overlayButton?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
+        regionSelectorOverlay?.hide()
+        regionSelectorOverlay = null
+
+        listOf(overlayButton, resetButton, regionButton).forEach { v ->
+            v?.let { try { windowManager.removeView(it) } catch (_: Exception) {} }
         }
         overlayButton = null
+        resetButton   = null
+        regionButton  = null
     }
+
+    private fun buildRegionButton(): Button {
+        return Button(this).apply {
+            text = "⊞"
+            setBackgroundColor(Color.parseColor("#37474F"))  // dark blue-grey
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            setPadding(24, 12, 24, 12)
+            setOnClickListener { enterRegionSelectMode() }
+        }
+    }
+
+    private fun enterRegionSelectMode() {
+        if (regionSelectorOverlay != null) return
+        solverPipeline.enabled = false
+        Log.i(TAG, "Entering region select mode")
+
+        regionSelectorOverlay = RegionSelectorOverlay(
+            context      = this,
+            wm           = windowManager,
+            screenWidth  = screenWidth,
+            screenHeight = screenHeight,
+            initial      = RegionConfig.load(this),
+            onConfirm    = { config -> applyNewRegion(config) },
+            onCancel     = { exitRegionSelectMode() }
+        ).also { it.show() }
+    }
+
+    private fun applyNewRegion(config: RegionConfig) {
+        RegionConfig.save(this, config)
+        solverPipeline.questionRegion = config.toCaptureConfig().questionRegion(screenWidth, screenHeight)
+        Log.i(TAG, "Region updated: top=${config.topFraction} bottom=${config.bottomFraction} " +
+            "left=${config.leftFraction} right=${config.rightFraction}")
+        exitRegionSelectMode()
+    }
+
+    private fun exitRegionSelectMode() {
+        regionSelectorOverlay?.hide()
+        regionSelectorOverlay = null
+        solverPipeline.enabled = captureActive  // re-enable only if capture is running
+        updateOverlayButtonState()
+        Log.i(TAG, "Exited region select mode")
+    }
+
+    private fun buildResetButton(): Button {
+        return Button(this).apply {
+            text = "↺"
+            setBackgroundColor(Color.parseColor("#546E7A"))  // blue-grey
+            setTextColor(Color.WHITE)
+            textSize = 16f
+            setPadding(24, 12, 24, 12)
+            setOnClickListener {
+                solverPipeline.reset()
+                NanoAccessibilityService.resetCache()
+                Log.i(TAG, "Reset tapped — pipeline and node cache cleared")
+                updateOverlayButtonState()
+            }
+        }
+    }
+
+    /** Converts dp to pixels using this context's display metrics. */
+    private fun dpToPx(dp: Int): Int =
+        (dp * resources.displayMetrics.density + 0.5f).toInt()
 
     // -------------------------------------------------------------------------
     // Helpers

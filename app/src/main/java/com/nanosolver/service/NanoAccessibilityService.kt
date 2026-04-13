@@ -97,6 +97,17 @@ class NanoAccessibilityService : AccessibilityService() {
         val isEnabled: Boolean get() = instance != null
 
         /**
+         * Clears the cached input/submit node references.
+         *
+         * Called by SolverPipeline.reset() when the user taps the Reset button
+         * between questions. Forces the next inject to re-discover nodes via the
+         * slow path, ensuring stale references from the previous question are dropped.
+         */
+        fun resetCache() {
+            instance?.invalidateNodeCache()
+        }
+
+        /**
          * Called by SolverPipeline when a new answer is computed.
          * Thread-safe: can be called from any thread.
          *
@@ -256,49 +267,178 @@ class NanoAccessibilityService : AccessibilityService() {
 
     /**
      * Slow-path injection: searches the tree, injects, then caches discovered nodes.
+     *
+     * Injection strategy (in order):
+     *   1. Find an editable input field → ACTION_SET_TEXT / clipboard paste.
+     *   2. Find a digit keypad (0–9 clickable buttons) → tap digits in sequence.
      */
     private fun slowPathInject(root: AccessibilityNodeInfo, answer: Long): Boolean {
         Log.d(TAG, "inject: slow path (tree search)")
 
         val inputNode = findAnswerInput(root)
-        if (inputNode == null) {
-            Log.w(TAG, "inject: answer input not found — enable VERBOSE for tree dump")
-            logNodeTree(root, label = "WINDOW TREE")
+        if (inputNode != null) {
+            var submitNode: AccessibilityNodeInfo? = null
+            return try {
+                val textSet = setAnswerText(inputNode, answer)
+                if (!textSet) return false
+
+                submitNode = findSubmitNode(root)
+                val submitted = if (submitNode != null) {
+                    val clicked = submitNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    Log.d(TAG, "inject: submit clicked (slow path): $clicked")
+                    clicked
+                } else {
+                    Log.d(TAG, "inject: no submit button found — pressing IME action")
+                    inputNode.performAction(ACTION_IME_ENTER)
+                }
+
+                if (submitted) {
+                    synchronized(nodeCacheLock) {
+                        clearCachedNodesLocked()
+                        @Suppress("DEPRECATION")
+                        cachedInputNode  = AccessibilityNodeInfo.obtain(inputNode)
+                        @Suppress("DEPRECATION")
+                        cachedSubmitNode = submitNode?.let { AccessibilityNodeInfo.obtain(it) }
+                    }
+                    Log.d(TAG, "inject: nodes cached for future fast-path use")
+                }
+                submitted
+            } finally {
+                @Suppress("DEPRECATION") inputNode.recycle()
+                @Suppress("DEPRECATION") submitNode?.recycle()
+            }
+        }
+
+        // No editable input found — try the on-screen digit keypad (Matiks Sprint mode).
+        val digitMap = findDigitKeypad(root)
+        if (digitMap != null) {
+            Log.d(TAG, "inject: digit keypad found (${digitMap.size} buttons)")
+            return try {
+                injectViaDigitButtons(digitMap, answer, root)
+            } finally {
+                digitMap.values.forEach { @Suppress("DEPRECATION") it.recycle() }
+            }
+        }
+
+        Log.w(TAG, "inject: no input field or digit keypad found — enable VERBOSE for tree dump")
+        logNodeTree(root, label = "WINDOW TREE")
+        return false
+    }
+
+    // -------------------------------------------------------------------------
+    // Digit keypad injection
+    // -------------------------------------------------------------------------
+
+    /**
+     * Searches [root] for 10 distinct single-digit clickable buttons (0–9).
+     *
+     * Returns a map from '0'..'9' to the corresponding node if all 10 are found,
+     * or null if the keypad is not present. The returned nodes are new copies
+     * (via obtain) — the caller MUST recycle them.
+     */
+    private fun findDigitKeypad(root: AccessibilityNodeInfo): Map<Char, AccessibilityNodeInfo>? {
+        val map = mutableMapOf<Char, AccessibilityNodeInfo>()
+        collectDigitButtons(root, map)
+
+        if (map.size < 10) {
+            // Not a full keypad — recycle partial results and signal absence.
+            map.values.forEach { @Suppress("DEPRECATION") it.recycle() }
+            return null
+        }
+        return map
+    }
+
+    /** DFS that populates [map] with '0'..'9' → node entries for clickable digit buttons. */
+    private fun collectDigitButtons(
+        node: AccessibilityNodeInfo,
+        map: MutableMap<Char, AccessibilityNodeInfo>
+    ) {
+        if (node.isClickable) {
+            val label = (node.text?.toString()?.trim()
+                ?: node.contentDescription?.toString()?.trim())
+            if (label?.length == 1 && label[0].isDigit() && !map.containsKey(label[0])) {
+                @Suppress("DEPRECATION")
+                map[label[0]] = AccessibilityNodeInfo.obtain(node)
+            }
+        }
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectDigitButtons(child, map)
+            @Suppress("DEPRECATION") child.recycle()
+        }
+    }
+
+    /**
+     * Injects [answer] by clicking the digit buttons in [digitMap] one at a time.
+     *
+     * Steps:
+     *   1. Click the clear button (C/CE/DEL/⌫) if present — prevents appending to a
+     *      prior answer.
+     *   2. Click each digit of the answer string with a 20ms pause between taps.
+     *      20ms is enough for the UI to register the click; too short risks missed taps.
+     *   3. Click the submit button.
+     *
+     * Note: Matiks never shows negative answers, so negative [answer] values should
+     * not reach this path — but we guard anyway by returning false for answer < 0.
+     */
+    private fun injectViaDigitButtons(
+        digitMap: Map<Char, AccessibilityNodeInfo>,
+        answer: Long,
+        root: AccessibilityNodeInfo
+    ): Boolean {
+        if (answer < 0) {
+            Log.w(TAG, "injectViaDigitButtons: negative answer ($answer) — skipping")
             return false
         }
 
-        var submitNode: AccessibilityNodeInfo? = null
-        return try {
-            val textSet = setAnswerText(inputNode, answer)
-            if (!textSet) return false
+        // Step 1: Clear any prior input.
+        val clearNode = findClearButton(root)
+        if (clearNode != null) {
+            clearNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            Log.d(TAG, "digit keypad: clear button clicked")
+            @Suppress("DEPRECATION") clearNode.recycle()
+        }
 
-            submitNode = findSubmitNode(root)
-            val submitted  = if (submitNode != null) {
-                val clicked = submitNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                Log.d(TAG, "inject: submit clicked (slow path): $clicked")
-                clicked
-            } else {
-                Log.d(TAG, "inject: no submit button found — pressing IME action")
-                inputNode.performAction(ACTION_IME_ENTER)
+        // Step 2: Tap each digit.
+        for (ch in answer.toString()) {
+            val digitNode = digitMap[ch]
+            if (digitNode == null) {
+                Log.w(TAG, "digit keypad: no button found for '$ch' — aborting")
+                return false
             }
+            val clicked = digitNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            Log.d(TAG, "digit keypad: '$ch' clicked=$clicked")
+            if (!clicked) return false
+            Thread.sleep(20)
+        }
 
-            if (submitted) {
-                // Cache both nodes. obtain() creates our own copy that won't be recycled
-                // by the framework until we explicitly recycle it.
-                synchronized(nodeCacheLock) {
-                    clearCachedNodesLocked()
-                    @Suppress("DEPRECATION")
-                    cachedInputNode  = AccessibilityNodeInfo.obtain(inputNode)
-                    @Suppress("DEPRECATION")
-                    cachedSubmitNode = submitNode?.let { AccessibilityNodeInfo.obtain(it) }
-                }
-                Log.d(TAG, "inject: nodes cached for future fast-path use")
-            }
+        // Step 3: Submit.
+        val submitNode = findSubmitNode(root)
+        val submitted = if (submitNode != null) {
+            val ok = submitNode.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            Log.d(TAG, "digit keypad: submit clicked=$ok")
+            @Suppress("DEPRECATION") submitNode.recycle()
+            ok
+        } else {
+            Log.d(TAG, "digit keypad: no submit button — answer typed but not submitted")
+            true  // digits were entered; submit may be automatic
+        }
+        return submitted
+    }
 
-            submitted
-        } finally {
-            @Suppress("DEPRECATION") inputNode.recycle()
-            @Suppress("DEPRECATION") submitNode?.recycle()
+    /**
+     * Finds a clear/delete button near the digit keypad.
+     *
+     * Returns a new node owned by the caller (must be recycled), or null.
+     */
+    private fun findClearButton(root: AccessibilityNodeInfo): AccessibilityNodeInfo? {
+        val clearLabels = setOf("C", "CE", "DEL", "⌫", "CLR")
+        return findNodeWithPredicate(root) { node ->
+            if (!node.isClickable || !node.isEnabled) return@findNodeWithPredicate false
+            val label = node.text?.toString()?.trim()
+                ?: node.contentDescription?.toString()?.trim()
+                ?: return@findNodeWithPredicate false
+            label.uppercase() in clearLabels
         }
     }
 

@@ -8,6 +8,7 @@ import com.nanosolver.ocr.ImagePreprocessor
 import com.nanosolver.ocr.TextExtractor
 import com.nanosolver.service.NanoAccessibilityService
 import com.nanosolver.solver.MathParser
+import com.nanosolver.solver.SolverCache
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
@@ -133,12 +134,29 @@ class SolverPipeline(
     private val pipelineBusy = AtomicBoolean(false)
 
     /**
-     * Precomputed question region in absolute pixels.
+     * Question region in absolute pixels.
      *
-     * Computed once at construction time from [config] fractions and device
-     * [screenWidth]/[screenHeight]. Reused every frame — no allocation per frame.
+     * Initialised from [config] fractions at construction time.
+     * Declared @Volatile var so RegionSelectorOverlay (Plan 2 Phase 3) can
+     * update it on the main thread while the pipeline reads it on Dispatchers.Default.
+     * Reads are atomic on all JVM implementations for object references.
      */
-    private val questionRegion: Rect = config.questionRegion(screenWidth, screenHeight)
+    @Volatile var questionRegion: Rect = config.questionRegion(screenWidth, screenHeight)
+
+    /**
+     * The last answer that was successfully injected.
+     *
+     * Prevents re-injecting the same answer on every frame while the same question
+     * is displayed. Cleared by [reset] when the user signals a new question is coming.
+     */
+    @Volatile private var lastInjectedAnswer: Long? = null
+
+    /**
+     * Requires the same answer on 3 consecutive frames before injecting.
+     * Rejects single-frame OCR glitches from score/timer digits on screen.
+     * Single-threaded: only ever called from the pipeline coroutine past the gate.
+     */
+    private val stabilizer = AnswerStabilizer(requiredConsecutive = 3)
 
     // Rolling stats — single writer (pipeline coroutine after gate), no sync needed.
     private var solvedFrames = 0
@@ -150,6 +168,25 @@ class SolverPipeline(
     // -------------------------------------------------------------------------
     // Public API
     // -------------------------------------------------------------------------
+
+    /**
+     * Resets transient pipeline state for a new question.
+     *
+     * Call this when the user taps the Reset button (↺) between questions.
+     * Safe to call from any thread.
+     *
+     *  - Clears [lastInjectedAnswer] so the next solve triggers a fresh inject.
+     *  - Clears [SolverCache] (expressions from the previous question are unlikely
+     *    to appear again immediately, and stale cache entries could mask new answers).
+     *  - Unlocks [pipelineBusy] as a safety net in case the gate is stuck.
+     */
+    fun reset() {
+        lastInjectedAnswer = null
+        stabilizer.reset()
+        SolverCache.clear()
+        pipelineBusy.set(false)
+        Log.i(TAG, "Pipeline reset — lastInjectedAnswer cleared, stabilizer reset, cache cleared")
+    }
 
     /**
      * Submits a new screen frame into the pipeline.
@@ -226,13 +263,23 @@ class SolverPipeline(
 
             answer ?: return
 
+            // Stabilization: require the same answer on 3 consecutive frames.
+            // Rejects single-frame OCR noise from score/timer digits.
+            val stableAnswer = stabilizer.feed(answer) ?: return
+
+            // Deduplication: skip inject if this is the same answer we already injected.
+            // Cleared by reset() when the user signals a new question.
+            if (stableAnswer == lastInjectedAnswer) return
+
             // ── Stage 4: Inject ────────────────────────────────────────────
             // Phase 7: NanoAccessibilityService uses cached node references —
             // fast path skips tree traversal entirely (~1–3ms vs ~5–15ms).
             Trace.beginSection(TRACE_INJECT)
-            NanoAccessibilityService.injectAnswer(answer)
+            NanoAccessibilityService.injectAnswer(stableAnswer)
             val t4 = System.nanoTime()
             Trace.endSection()
+
+            lastInjectedAnswer = stableAnswer
 
             // ── Latency stats ──────────────────────────────────────────────
             val stats = LatencyStats(
@@ -245,7 +292,7 @@ class SolverPipeline(
             )
 
             recordStats(stats)
-            onAnswer(answer, stats)
+            onAnswer(stableAnswer, stats)
 
         } catch (e: Exception) {
             Log.e(TAG, "Pipeline error on frame #${solvedFrames + 1}: ${e.message}")
