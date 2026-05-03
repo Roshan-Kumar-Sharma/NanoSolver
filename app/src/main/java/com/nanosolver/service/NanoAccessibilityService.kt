@@ -9,9 +9,19 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
 /**
- * NanoAccessibilityService — Phase 7
+ * NanoAccessibilityService — Plan 2
  *
- * Phase 7 adds NODE REFERENCE CACHING to cut inject latency from ~5–15ms
+ * Plan 2 adds the DIGIT KEYPAD INJECTION path: when Matiks renders an on-screen
+ * 0–9 numeric keypad instead of a real EditText, we detect the 10 clickable
+ * digit buttons by DFS, then click them in sequence to type the answer. See
+ * [findDigitKeypad] and [injectViaDigitButtons].
+ *
+ * Plan 2 also exposes [resetCache] on the companion object, called by
+ * SolverPipeline.reset() when the user taps the ↺ overlay button — forces the
+ * next inject through the slow path so stale node references from the prior
+ * question are dropped.
+ *
+ * Phase 7 added NODE REFERENCE CACHING to cut inject latency from ~5–15ms
  * to ~1–3ms after the first problem in a session.
  *
  * ──────────────────────────────────────────────────────────────────────────
@@ -161,7 +171,7 @@ class NanoAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Handles accessibility events.
+     * Handles accessibility events.`
      *
      * TYPE_WINDOW_STATE_CHANGED fires when the user navigates to a different
      * Activity/Dialog. In Sprint mode this fires when:
@@ -353,9 +363,18 @@ class NanoAccessibilityService : AccessibilityService() {
         node: AccessibilityNodeInfo,
         map: MutableMap<Char, AccessibilityNodeInfo>
     ) {
-        if (node.isClickable) {
-            val label = (node.text?.toString()?.trim()
-                ?: node.contentDescription?.toString()?.trim())
+        if (node.isClickable && node.isEnabled) {
+            // Prefer non-blank text; fall back to non-blank contentDescription.
+            // (A digit button may set one but not the other; using `?:` directly
+            // misses the case where text is "" — a blank string is non-null so the
+            // `?:` doesn't fire and we'd never inspect contentDescription.)
+            val text = node.text?.toString()?.trim().orEmpty()
+            val cd   = node.contentDescription?.toString()?.trim().orEmpty()
+            val label = when {
+                text.isNotEmpty() -> text
+                cd.isNotEmpty()   -> cd
+                else              -> null
+            }
             if (label?.length == 1 && label[0].isDigit() && !map.containsKey(label[0])) {
                 @Suppress("DEPRECATION")
                 map[label[0]] = AccessibilityNodeInfo.obtain(node)
@@ -435,9 +454,13 @@ class NanoAccessibilityService : AccessibilityService() {
         val clearLabels = setOf("C", "CE", "DEL", "⌫", "CLR")
         return findNodeWithPredicate(root) { node ->
             if (!node.isClickable || !node.isEnabled) return@findNodeWithPredicate false
-            val label = node.text?.toString()?.trim()
-                ?: node.contentDescription?.toString()?.trim()
-                ?: return@findNodeWithPredicate false
+            val text = node.text?.toString()?.trim().orEmpty()
+            val cd   = node.contentDescription?.toString()?.trim().orEmpty()
+            val label = when {
+                text.isNotEmpty() -> text
+                cd.isNotEmpty()   -> cd
+                else              -> return@findNodeWithPredicate false
+            }
             label.uppercase() in clearLabels
         }
     }

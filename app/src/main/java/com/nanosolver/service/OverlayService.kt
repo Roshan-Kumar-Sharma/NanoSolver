@@ -25,7 +25,6 @@ import androidx.core.app.NotificationCompat
 import com.nanosolver.capture.ScreenCaptureManager
 import com.nanosolver.ocr.ImagePreprocessor
 import com.nanosolver.ocr.TextExtractor
-import com.nanosolver.pipeline.CaptureConfig
 import com.nanosolver.pipeline.LatencyStats
 import com.nanosolver.pipeline.RegionConfig
 import com.nanosolver.pipeline.SolverPipeline
@@ -36,18 +35,22 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 
 /**
- * OverlayService — Phase 7
+ * OverlayService — Plan 2
  *
- * Hosts the SolverPipeline and overlay UI. Phase 7 changes:
+ * Hosts the SolverPipeline and the floating overlay UI. The UI consists of three
+ * stacked buttons that float over Matiks:
  *
- *  - Passes [CaptureConfig] (question region fractions + OCR target width)
- *    and screen dimensions to SolverPipeline, enabling targeted cropping
- *    and resolution scaling before OCR (~70ms faster per frame).
+ *   ▶/●/⏸ Solver  — toggle pipeline on/off (start/pause)
+ *   ↺ Reset       — clear lastInjectedAnswer + node cache + solver cache + stabilizer
+ *   ⊞ Region      — open the RegionSelectorOverlay to redraw the OCR crop area
  *
- *  - Screen dimensions are read once in onCreate() from DisplayMetrics
- *    and forwarded to the pipeline; no per-frame allocation.
+ * Plan 2 additions:
+ *  - Loads persisted [RegionConfig] in onCreate() instead of using hardcoded fractions.
+ *  - Updates [SolverPipeline.questionRegion] in place when the user confirms a new region.
+ *  - Wires the reset button to [SolverPipeline.reset] and [NanoAccessibilityService.resetCache].
  *
  * Earlier phases:
+ *  - Phase 7: targeted crop + 720px OCR scale + node caching + Trace markers.
  *  - Phase 6: SolverPipeline wiring, toggle button, latency HUD.
  *  - Phase 5: AccessibilityService injection.
  *  - Phase 3: OCR pipeline + coroutine scope.
@@ -62,6 +65,11 @@ class OverlayService : Service() {
 
         const val EXTRA_RESULT_CODE     = "extra_result_code"
         const val EXTRA_PROJECTION_DATA = "extra_projection_data"
+
+        // Floating overlay layout — all values in dp for density independence.
+        private const val STACK_X_DP      = 16   // distance from left edge
+        private const val STACK_BASE_Y_DP = 100  // distance from top edge for first button
+        private const val BUTTON_ROW_DP   = 56   // 44dp button + 8dp gap × 2 ≈ 56dp row pitch
 
         @Volatile var isRunning:     Boolean = false; private set
         @Volatile var captureActive: Boolean = false; private set
@@ -251,27 +259,25 @@ class OverlayService : Service() {
     private fun showOverlay() {
         if (overlayButton != null) return
 
-        val params = buildLayoutParams()
+        // Three buttons stacked vertically, anchored at the same x = STACK_X_DP.
+        // Each row is BUTTON_ROW_DP tall (handle + 8dp gap).
+        val stackX  = dpToPx(STACK_X_DP)
+        val baseY   = dpToPx(STACK_BASE_Y_DP)
+        val rowStep = dpToPx(BUTTON_ROW_DP)
+
+        val params = buildLayoutParams().apply { x = stackX; y = baseY }
         val button = buildOverlayButton(params)
         overlayButton = button
         windowManager.addView(button, params)
 
-        // Reset button (↺) — directly below the solver button.
-        val resetParams = buildLayoutParams().apply {
-            x = 50
-            y = 300 + dpToPx(44) + dpToPx(8)
-        }
-        val rb = buildResetButton()
-        resetButton = rb
+        val resetParams  = buildLayoutParams().apply { x = stackX; y = baseY + rowStep }
+        val rb           = buildResetButton()
+        resetButton      = rb
         windowManager.addView(rb, resetParams)
 
-        // Region selector button (⊞) — directly below the reset button.
-        val regionParams = buildLayoutParams().apply {
-            x = 50
-            y = 300 + dpToPx(44) + dpToPx(8) + dpToPx(44) + dpToPx(8)
-        }
-        val regBtn = buildRegionButton()
-        regionButton = regBtn
+        val regionParams = buildLayoutParams().apply { x = stackX; y = baseY + 2 * rowStep }
+        val regBtn       = buildRegionButton()
+        regionButton     = regBtn
         windowManager.addView(regBtn, regionParams)
     }
 
@@ -323,8 +329,7 @@ class OverlayService : Service() {
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.START
-            x = 50
-            y = 300
+            // x/y left at 0; showOverlay() sets them per-button using dp constants.
         }
     }
 
@@ -404,7 +409,7 @@ class OverlayService : Service() {
             setBackgroundColor(Color.parseColor("#37474F"))  // dark blue-grey
             setTextColor(Color.WHITE)
             textSize = 16f
-            setPadding(24, 12, 24, 12)
+            setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
             setOnClickListener { enterRegionSelectMode() }
         }
     }
@@ -447,7 +452,7 @@ class OverlayService : Service() {
             setBackgroundColor(Color.parseColor("#546E7A"))  // blue-grey
             setTextColor(Color.WHITE)
             textSize = 16f
-            setPadding(24, 12, 24, 12)
+            setPadding(dpToPx(12), dpToPx(6), dpToPx(12), dpToPx(6))
             setOnClickListener {
                 solverPipeline.reset()
                 NanoAccessibilityService.resetCache()

@@ -57,8 +57,8 @@ class RegionSelectorOverlay(
     private var leftFrac   = initial.leftFraction
     private var rightFrac  = initial.rightFraction
 
-    // Minimum region size: each axis must span at least 5% of the screen.
-    private val minFrac = 0.05f
+    // Minimum region size on each axis (10% of screen, per Plan 2 spec).
+    private val minFrac = 0.10f
 
     // All views managed by this overlay — tracked for cleanup in hide().
     private val views = mutableListOf<View>()
@@ -68,6 +68,13 @@ class RegionSelectorOverlay(
     private lateinit var bottomLine: View
     private lateinit var leftLine:   View
     private lateinit var rightLine:  View
+
+    // Persistent LayoutParams per line — mutated in place during drag to avoid
+    // allocating four new objects per frame (smooth 60fps drag).
+    private lateinit var topLineParams:    WindowManager.LayoutParams
+    private lateinit var bottomLineParams: WindowManager.LayoutParams
+    private lateinit var leftLineParams:   WindowManager.LayoutParams
+    private lateinit var rightLineParams:  WindowManager.LayoutParams
 
     // ── Public API ──────────────────────────────────────────────────────────────
 
@@ -104,11 +111,15 @@ class RegionSelectorOverlay(
         leftLine   = makeVerticalLine()
         rightLine  = makeVerticalLine()
 
-        listOf(topLine, bottomLine, leftLine, rightLine).forEach { line ->
-            val params = lineParams()
-            wm.addView(line, params)
-            views += line
-        }
+        topLineParams    = lineParams()
+        bottomLineParams = lineParams()
+        leftLineParams   = lineParams()
+        rightLineParams  = lineParams()
+
+        wm.addView(topLine,    topLineParams);    views += topLine
+        wm.addView(bottomLine, bottomLineParams); views += bottomLine
+        wm.addView(leftLine,   leftLineParams);   views += leftLine
+        wm.addView(rightLine,  rightLineParams);  views += rightLine
 
         updateEdgeLines()
     }
@@ -124,6 +135,9 @@ class RegionSelectorOverlay(
     /**
      * Repositions the four edge lines to match the current fraction state.
      * Called after every drag event on a corner handle.
+     *
+     * Mutates persistent LayoutParams in place rather than allocating new
+     * instances — at 60fps drag with 4 lines that's 240 saved allocations/sec.
      */
     private fun updateEdgeLines() {
         val lineThickness = dpToPx(2)
@@ -132,21 +146,20 @@ class RegionSelectorOverlay(
         val bottomPx = (bottomFrac * screenHeight).toInt()
         val leftPx   = (leftFrac   * screenWidth).toInt()
         val rightPx  = (rightFrac  * screenWidth).toInt()
+        val rectW    = rightPx - leftPx
+        val rectH    = bottomPx - topPx
 
-        updateLineLayout(topLine,    x = leftPx, y = topPx,
-            w = rightPx - leftPx, h = lineThickness)
-        updateLineLayout(bottomLine, x = leftPx, y = bottomPx,
-            w = rightPx - leftPx, h = lineThickness)
-        updateLineLayout(leftLine,   x = leftPx,  y = topPx,
-            w = lineThickness,    h = bottomPx - topPx)
-        updateLineLayout(rightLine,  x = rightPx, y = topPx,
-            w = lineThickness,    h = bottomPx - topPx)
+        applyLineLayout(topLine,    topLineParams,    leftPx,  topPx,    rectW,         lineThickness)
+        applyLineLayout(bottomLine, bottomLineParams, leftPx,  bottomPx, rectW,         lineThickness)
+        applyLineLayout(leftLine,   leftLineParams,   leftPx,  topPx,    lineThickness, rectH)
+        applyLineLayout(rightLine,  rightLineParams,  rightPx, topPx,    lineThickness, rectH)
     }
 
-    private fun updateLineLayout(view: View, x: Int, y: Int, w: Int, h: Int) {
-        val params = lineParams().apply {
-            this.x = x; this.y = y; this.width = w; this.height = h
-        }
+    private fun applyLineLayout(
+        view: View, params: WindowManager.LayoutParams,
+        x: Int, y: Int, w: Int, h: Int
+    ) {
+        params.x = x; params.y = y; params.width = w; params.height = h
         try { wm.updateViewLayout(view, params) } catch (_: Exception) {}
     }
 
@@ -180,23 +193,59 @@ class RegionSelectorOverlay(
             val handle = makeHandle()
             val params = handleParams()
             positionHandle(params, corner.label)
+
+            // Offset between finger touch point and the corner anchor on ACTION_DOWN.
+            // Keeping this offset stable during ACTION_MOVE prevents the "jump-to-finger"
+            // effect: if the user grabs the edge of the handle, the corner stays where
+            // they grabbed it instead of snapping to be centered under the finger.
+            var grabOffsetX = 0f
+            var grabOffsetY = 0f
+
             handle.setOnTouchListener { _, event ->
                 when (event.action) {
+                    MotionEvent.ACTION_DOWN -> {
+                        // Anchor in screen pixels at touch start.
+                        val anchorX = cornerAnchorX(corner.label).toFloat()
+                        val anchorY = cornerAnchorY(corner.label).toFloat()
+                        grabOffsetX = event.rawX - anchorX
+                        grabOffsetY = event.rawY - anchorY
+                        // CRITICAL: must return true so subsequent ACTION_MOVE / UP
+                        // events in this gesture are delivered to this listener.
+                        // Returning false here was the reason drag was completely broken.
+                        true
+                    }
                     MotionEvent.ACTION_MOVE -> {
-                        val xFrac = (event.rawX / screenWidth).coerceIn(0f, 1f)
-                        val yFrac = (event.rawY / screenHeight).coerceIn(0f, 1f)
+                        val targetX = event.rawX - grabOffsetX
+                        val targetY = event.rawY - grabOffsetY
+                        val xFrac = (targetX / screenWidth).coerceIn(0f, 1f)
+                        val yFrac = (targetY / screenHeight).coerceIn(0f, 1f)
                         corner.update(xFrac, yFrac)
                         positionHandle(params, corner.label)
                         try { wm.updateViewLayout(handle, params) } catch (_: Exception) {}
                         updateEdgeLines()
                         true
                     }
+                    MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> true
                     else -> false
                 }
             }
             wm.addView(handle, params)
             views += handle
         }
+    }
+
+    /** Current X pixel for [label]'s corner anchor (the point the handle is centered on). */
+    private fun cornerAnchorX(label: String): Int = when (label) {
+        "TL", "BL" -> (leftFrac  * screenWidth).toInt()
+        "TR", "BR" -> (rightFrac * screenWidth).toInt()
+        else -> 0
+    }
+
+    /** Current Y pixel for [label]'s corner anchor. */
+    private fun cornerAnchorY(label: String): Int = when (label) {
+        "TL", "TR" -> (topFrac    * screenHeight).toInt()
+        "BL", "BR" -> (bottomFrac * screenHeight).toInt()
+        else -> 0
     }
 
     private fun makeHandle(): View {
@@ -213,18 +262,9 @@ class RegionSelectorOverlay(
 
     /** Positions [params] to the correct corner based on the current fractions. */
     private fun positionHandle(params: WindowManager.LayoutParams, corner: String) {
-        val handleSize = dpToPx(44)
-        val half = handleSize / 2
-        when (corner) {
-            "TL" -> { params.x = (leftFrac  * screenWidth).toInt()  - half
-                       params.y = (topFrac   * screenHeight).toInt() - half }
-            "TR" -> { params.x = (rightFrac  * screenWidth).toInt()  - half
-                       params.y = (topFrac    * screenHeight).toInt() - half }
-            "BL" -> { params.x = (leftFrac   * screenWidth).toInt()  - half
-                       params.y = (bottomFrac * screenHeight).toInt() - half }
-            "BR" -> { params.x = (rightFrac  * screenWidth).toInt()  - half
-                       params.y = (bottomFrac * screenHeight).toInt() - half }
-        }
+        val half = dpToPx(44) / 2
+        params.x = cornerAnchorX(corner) - half
+        params.y = cornerAnchorY(corner) - half
     }
 
     // ── Action buttons ──────────────────────────────────────────────────────────
